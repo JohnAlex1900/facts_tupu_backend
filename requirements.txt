@@ -4,6 +4,7 @@ pydantic
 prometheus-client
 email-validator
 python-dotenv
+python-multipart
 asyncpg
 httpx
 ddgs
