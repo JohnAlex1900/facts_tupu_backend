@@ -1,6 +1,7 @@
 fastapi
 uvicorn[standard]
 pydantic
+promethues-client
 email-validator
 python-dotenv
 asyncpg
