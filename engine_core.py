@@ -1116,9 +1116,23 @@ async def get_harmonized_profiles(
                     ELSE 2 
                 END AS numeric_sort_id
             FROM national_executive ne
-            LEFT JOIN latest_metrics m1 ON m1.associated_id = LOWER(ne.office_id)
-            LEFT JOIN latest_metrics m2 ON m2.associated_id = LOWER('inc-' || ne.office_id || '-000')
-            LEFT JOIN latest_metrics m3 ON m3.associated_id = 'executive'
+            LEFT JOIN latest_metrics m1 ON m1.target_type = (
+                CASE 
+                    WHEN LOWER(ne.role) LIKE '%deputy%' THEN 'deputy_president'
+                    WHEN LOWER(ne.role) LIKE '%president%' THEN 'president' 
+                    ELSE 'executive' 
+                END
+            ) AND m1.associated_id = LOWER(ne.office_id)
+            
+            LEFT JOIN latest_metrics m2 ON m2.target_type = (
+                CASE 
+                    WHEN LOWER(ne.role) LIKE '%deputy%' THEN 'deputy_president'
+                    WHEN LOWER(ne.role) LIKE '%president%' THEN 'president' 
+                    ELSE 'executive' 
+                END
+            ) AND m2.associated_id = LOWER('inc-' || ne.office_id || '-000')
+            
+            LEFT JOIN latest_metrics m3 ON m3.target_type = 'executive' AND m3.associated_id = 'executive'
             LEFT JOIN challenger_data c ON c.target_role = (
                 CASE 
                     WHEN LOWER(ne.role) LIKE '%deputy%' THEN 'deputy_president'
