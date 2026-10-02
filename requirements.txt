@@ -1,0 +1,13 @@
+fastapi
+uvicorn[standard]
+pydantic
+email-validator
+python-dotenv
+asyncpg
+httpx
+ddgs
+groq
+bcrypt
+pypdf
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
