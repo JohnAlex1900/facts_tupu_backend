@@ -545,7 +545,7 @@ async def analyze_live_hate_speech(
                 "https://api.groq.com/openai/v1/chat/completions",
                 headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
                 json={
-                    "model": "openai/gpt-oss-120b",
+                    "model": "openai/gpt-oss-20b",
                     "messages": [
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_content}
