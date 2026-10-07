@@ -431,17 +431,29 @@ async def analyze_representative_deep_dive(c: Dict[str, Any]) -> Dict[str, Any]:
     try:
         search_query = f"{full_name} {location} {target_role} Kenya news development"
         
+        # 1. Try DDGS first
         try:
             with DDGS() as ddgs:
                 ddg_results = list(ddgs.text(search_query, max_results=5, region="wt-wt"))
-                snippets = [
-                    f"- {item.get('title', '')}: {item.get('body', '')}" 
-                    for item in ddg_results if item.get("body")
-                ]
-                context_text = "\n".join(snippets) if snippets else "No recent organic search results found."
+                snippets = [f"- {item.get('title', '')}: {item.get('body', '')}" for item in ddg_results if item.get("body")]
         except Exception as e:
             print(f"DDGS Search Error for {full_name}: {e}")
-            context_text = "No recent organic search results found."
+            snippets = []
+
+        # 2. Add Google Search Fallback for deployed cloud environments
+        if not snippets and GOOGLE_SEARCH_API_KEY and GOOGLE_SEARCH_CX:
+            try:
+                url = "https://customsearch.googleapis.com/customsearch/v1"
+                params = {"key": GOOGLE_SEARCH_API_KEY, "cx": GOOGLE_SEARCH_CX, "q": search_query, "num": 5}
+                async with httpx.AsyncClient(timeout=6.0) as search_client:
+                    search_res = await search_client.get(url, params=params)
+                    if search_res.status_code == 200:
+                        data = search_res.json()
+                        snippets = [f"- {item.get('title', '')}: {item.get('snippet', '')}" for item in data.get("items", []) if item.get("snippet")]
+            except Exception as e:
+                print(f"Google Search fallback error: {e}")
+
+        context_text = "\n".join(snippets) if snippets else "No recent organic search results found."
 
         system_prompt = (
             "You are a strict, factual political analysis engine for 'Facts Tupu'.\n"
@@ -647,6 +659,7 @@ async def analyze_live_hate_speech(
         system_prompt = (
             "You are a strict, factual political analysis engine.\n"
             "Analyze the search snippets for the representative. Extract exact quotes or statements representing hate speech, political insults, or inflammatory rhetoric.\n"
+            "CRITICAL DIRECTIVE: You MUST ONLY extract statements that were spoken DIRECTLY BY the representative themselves, OR statements made BY third parties that are EXPLICITLY DIRECTED AT or directly related to this specific representative. Ignore unrelated inflammatory quotes in the text.\n"
             "Assign a 'severity_score' (0-100) for each statement.\n"
             "Respond STRICTLY with a JSON object:\n"
             "{\n"
