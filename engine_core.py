@@ -375,14 +375,22 @@ async def analyze_signals_with_ai(candidate_name: str, search_snippets: List[Dic
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_content}
                     ],
-                    "temperature": 0.2,
-                    "response_format": {"type": "json_object"}
+                    "temperature": 0.2
                 }
             )
             
             if response.status_code == 200:
                 res_data = response.json()
                 raw_text = res_data["choices"][0]["message"]["content"].strip()
+                
+                # Sanitize markdown code blocks
+                if raw_text.startswith("```json"):
+                    raw_text = raw_text[7:].strip()
+                elif raw_text.startswith("```"):
+                    raw_text = raw_text[3:].strip()
+                if raw_text.endswith("```"):
+                    raw_text = raw_text[:-3].strip()
+                    
                 parsed = json.loads(raw_text)
                 if isinstance(parsed, dict) and "events" in parsed:
                     return parsed["events"]
@@ -482,6 +490,100 @@ async def analyze_representative_deep_dive(c: Dict[str, Any]) -> Dict[str, Any]:
         print(f"Deep dive analysis failed for {full_name}: {str(e)}")
         return fallback_response
 
+
+
+
+
+
+# --- HELPER: UNIFIED TARGET & ASSOCIATED ID RESOLVER ---
+async def resolve_leader_id_async(
+    conn: asyncpg.Connection,
+    leader_id: Optional[str],
+    role: str,
+    name: str
+) -> tuple[Optional[str], Optional[str]]:
+    target_type = None
+    associated_id = None
+    
+    role_clean = (role or "").strip().lower()
+    if "deputy" in role_clean:
+        target_type = "deputy_president"
+    elif "president" in role_clean:
+        target_type = "president"
+    elif "governor" in role_clean:
+        target_type = "governor"
+    elif "senator" in role_clean:
+        target_type = "senator"
+    elif "woman" in role_clean or "women" in role_clean:
+        target_type = "women_rep"
+    elif "mp" in role_clean or "parliament" in role_clean:
+        target_type = "mp"
+    elif "mca" in role_clean or "assembly" in role_clean:
+        target_type = "mca"
+
+    # 1. Direct prefix lookup from explicit leader_id
+    if leader_id:
+        clean_id = leader_id.strip()
+        prefixes = [
+            ("inc-governor-", "governor"),
+            ("inc-senator-", "senator"),
+            ("inc-women_rep-", "women_rep"),
+            ("inc-mp-", "mp"),
+            ("inc-mca-", "mca"),
+            ("inc-president-", "president"),
+            ("inc-deputy_president-", "deputy_president"),
+        ]
+        for prefix, t_type in prefixes:
+            if clean_id.startswith(prefix):
+                associated_id = clean_id.replace(prefix, "")
+                target_type = t_type
+                return target_type, associated_id
+
+    # 2. Precise Database lookup by leader name
+    if name and name.strip() and target_type:
+        clean_name = name.strip()
+        try:
+            if target_type == "mp":
+                val = await conn.fetchval(
+                    "SELECT CAST(constituency_id AS text) FROM parliament_constituencies WHERE mp_name ILIKE $1 LIMIT 1",
+                    f"%{clean_name}%"
+                )
+                if val:
+                    return "mp", str(val)
+            elif target_type == "mca":
+                val = await conn.fetchval(
+                    "SELECT CAST(ward_id AS text) FROM local_assembly_wards WHERE mca_name ILIKE $1 LIMIT 1",
+                    f"%{clean_name}%"
+                )
+                if val:
+                    return "mca", str(val)
+            elif target_type in ["governor", "senator", "women_rep"]:
+                col = "governor_name" if target_type == "governor" else ("senator_name" if target_type == "senator" else "women_rep_name")
+                val = await conn.fetchval(
+                    f"SELECT county_code FROM county_executive_senate WHERE {col} ILIKE $1 LIMIT 1",
+                    f"%{clean_name}%"
+                )
+                if val:
+                    return target_type, str(val)
+            elif target_type in ["president", "deputy_president"]:
+                val = await conn.fetchval(
+                    "SELECT office_id FROM national_executive WHERE leader_name ILIKE $1 LIMIT 1",
+                    f"%{clean_name}%"
+                )
+                if val:
+                    return target_type, str(val)
+        except Exception as err:
+            print(f"DB resolution warning for {name}: {err}")
+
+    # 3. Fallback string extraction
+    if leader_id:
+        clean_id = leader_id.strip()
+        parts = clean_id.split("-")
+        associated_id = parts[1] if len(parts) >= 2 else clean_id
+
+    return target_type, associated_id
+
+
 @app.get("/api/v1/analytics/hate-speech")
 async def analyze_live_hate_speech(
     name: str = Query(..., description="Leader's name"),
@@ -490,156 +592,170 @@ async def analyze_live_hate_speech(
     conn = Depends(get_db_connection)
 ):
     fallback_score = calculate_hate_speech_score(name, role, [])
-    fallback_response = {
-        "hate_speech_score": fallback_score,
-        "statements": [],
-        "verdict": "No significant hate speech or inciting rhetoric flagged in recent public recordings."
-    }
+    target_type, associated_id = await resolve_leader_id_async(conn, leader_id, role, name)
 
-    if not GROQ_API_KEY:
-        return fallback_response
+    snippets = []
+    search_query = f'"{name}" {role} controversy insult statement Kenya news'
 
-    search_query = f'"{name}" {role} (scandal OR controversy OR history OR slam OR attack OR insult OR tusi OR matusi OR kashfa)'
-    
+    # 1. Search via DuckDuckGo with timeout protection
     def _fetch_ddg():
         try:
-            with DDGS() as ddgs:
-                return list(ddgs.text(search_query, max_results=15, region="ke-en"))
+            with DDGS(timeout=4) as ddgs:
+                return list(ddgs.text(search_query, max_results=5, region="wt-wt"))
         except Exception as e:
-            print(f"DDGS Search Error: {e}")
+            print(f"DDG Search bypass for {name}: {e}")
             return []
 
     try:
         ddg_results = await asyncio.to_thread(_fetch_ddg)
-        snippets = [f"- {item.get('title', '')}: {item.get('body', '')}" for item in ddg_results if item.get("body")]
-        context_text = "\n".join(snippets) if snippets else ""
+        if ddg_results:
+            snippets = [f"- {item.get('title', '')}: {item.get('body', '')}" for item in ddg_results if item.get("body")]
     except Exception as e:
-        print(f"Hate speech search error for {name}: {e}")
-        context_text = ""
+        print(f"Hate speech search execution error for {name}: {e}")
 
-    if not context_text:
-        return fallback_response
-
-    system_prompt = (
-        "You are a strict, factual political analysis engine.\n"
-        "Analyze the provided search snippets for the representative. Extract exact quotes or explicitly described statements representing hate speech, political insults, polarizing rhetoric, or incitement.\n"
-        "Calculate a 'severity_score' (0-100) for each statement based on how divisive or inflammatory it is.\n"
-        "Respond STRICTLY with a JSON object matching this layout:\n"
-        "{\n"
-        '  "statements": [\n'
-        '    {\n'
-        '      "quote": "Exact quote or strongly paraphrased claim",\n'
-        '      "context": "Context of where/when it was said",\n'
-        '      "severity_score": 85\n'
-        '    }\n'
-        '  ]\n'
-        "}\n"
-        "If absolutely no polarizing rhetoric is found, return an empty array for 'statements'."
-    )
-
-    user_content = f"Representative Name: {name}\nRole: {role}\n\nSearch Context:\n{context_text}"
-
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            ai_res = await client.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-                json={
-                    "model": "openai/gpt-oss-20b",
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_content}
-                    ],
-                    "temperature": 0.2,
-                    "response_format": {"type": "json_object"}
-                }
-            )
-
-            if ai_res.status_code != 200:
-                return fallback_response
-
-            payload = json.loads(ai_res.json()["choices"][0]["message"]["content"].strip())
-            statements = payload.get("statements", [])
-            
-            raw_highest = max([stmt.get("severity_score", 0) for stmt in statements]) if statements else 0
-            computed_score = round(float(max(fallback_score, raw_highest)), 1)
-            
-            # --- DATABASE PERSISTENCE LAYER ---
-            target_type = None
-            associated_id = None
-
-            if leader_id:
-                if leader_id.startswith("inc-mp-"):
-                    target_type = "mp"
-                    associated_id = leader_id.replace("inc-mp-", "")
-                elif leader_id.startswith("inc-mca-"):
-                    target_type = "mca"
-                    associated_id = leader_id.replace("inc-mca-", "")
-                elif leader_id.startswith("inc-governor-"):
-                    target_type = "governor"
-                    associated_id = leader_id.replace("inc-governor-", "")
-                elif leader_id.startswith("inc-senator-"):
-                    target_type = "senator"
-                    associated_id = leader_id.replace("inc-senator-", "")
-                elif leader_id.startswith("inc-women_rep-"):
-                    target_type = "women_rep"
-                    associated_id = leader_id.replace("inc-women_rep-", "")
-                else:
-                    associated_id = leader_id
-
-            if not target_type and role:
-                role_lower = role.lower()
-                if "mca" in role_lower or "county assembly" in role_lower:
-                    target_type = "mca"
-                elif "mp" in role_lower or "parliament" in role_lower:
-                    target_type = "mp"
-                elif "governor" in role_lower:
-                    target_type = "governor"
-                elif "senator" in role_lower:
-                    target_type = "senator"
-                elif "woman" in role_lower:
-                    target_type = "women_rep"
-                elif "president" in role_lower:
-                    target_type = "president"
-
-            if target_type and associated_id:
-                try:
-                    updated = await conn.execute(
-                        """
-                        UPDATE incumbent_accountability_metrics
-                        SET hate_speech_score = $1, updated_at = NOW()
-                        WHERE target_type = $2 AND associated_id = $3
-                        """,
-                        computed_score, target_type, associated_id
-                    )
-                    if updated == "UPDATE 0":
-                        await conn.execute(
-                            """
-                            INSERT INTO incumbent_accountability_metrics (
-                                target_type, associated_id, hate_speech_score, updated_at
-                            )
-                            VALUES ($1, $2, $3, NOW())
-                            """,
-                            target_type, associated_id, computed_score
-                        )
-                except Exception as db_err:
-                    print(f"Failed to persist hate speech score for {name}: {db_err}")
-
-            return {
-                "hate_speech_score": computed_score,
-                "statements": statements,
-                "verdict": "Divisive rhetoric detected across public platforms." if raw_highest > 0 else fallback_response["verdict"]
+    # 2. Search Fallback via Google Custom Search API
+    if not snippets and GOOGLE_SEARCH_API_KEY and GOOGLE_SEARCH_CX:
+        try:
+            url = "https://customsearch.googleapis.com/customsearch/v1"
+            params = {
+                "key": GOOGLE_SEARCH_API_KEY,
+                "cx": GOOGLE_SEARCH_CX,
+                "q": search_query,
+                "num": 5
             }
-    except Exception as e:
-        print(f"LLM parsing failed for {name}: {str(e)}")
-        return fallback_response
+            async with httpx.AsyncClient(timeout=6.0) as search_client:
+                search_res = await search_client.get(url, params=params)
+                if search_res.status_code == 200:
+                    data = search_res.json()
+                    if "items" in data:
+                        snippets = [f"- {item.get('title', '')}: {item.get('snippet', '')}" for item in data["items"] if item.get("snippet")]
+        except Exception as e:
+            print(f"Google Search fallback error for {name}: {e}")
+
+    # Safe context capping (prevents message length 400 errors)
+    raw_context = "\n".join(snippets) if snippets else ""
+    context_text = raw_context[:2500] if len(raw_context) > 2500 else raw_context
+
+    computed_score = fallback_score
+    statements = []
+    verdict = "No significant hate speech or inciting rhetoric flagged in recent public recordings."
+
+    # 3. Explicit OpenAI Evaluation (Hardcoded HTTPS Endpoint)
+    openai_endpoint = "https://api.openai.com/v1/chat/completions"
+
+    if OPENAI_API_KEY and context_text:
+        system_prompt = (
+            "You are a strict, factual political analysis engine.\n"
+            "Analyze the search snippets for the representative. Extract exact quotes or statements representing hate speech, political insults, or inflammatory rhetoric.\n"
+            "Assign a 'severity_score' (0-100) for each statement.\n"
+            "Respond STRICTLY with a JSON object:\n"
+            "{\n"
+            '  "statements": [\n'
+            '    {\n'
+            '      "quote": "Exact quote or claim",\n'
+            '      "context": "Platform/context",\n'
+            '      "severity_score": 85\n'
+            '    }\n'
+            '  ]\n'
+            "}\n"
+            "If no polarizing rhetoric is found, return {\"statements\": []}."
+        )
+
+        user_content = f"Representative Name: {name}\nRole: {role}\n\nSearch Context:\n{context_text}"
+
+        try:
+            async with httpx.AsyncClient(timeout=12.0) as client:
+                ai_res = await client.post(
+                    openai_endpoint,
+                    headers={
+                        "Authorization": f"Bearer {OPENAI_API_KEY}",
+                        "Content-Type": "application/json"
+                    },
+                    json={
+                        "model": OPENAI_MODEL if OPENAI_MODEL else "gpt-4o-mini",
+                        "messages": [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_content}
+                        ],
+                        "temperature": 0.1,
+                        "max_tokens": 600
+                    }
+                )
+
+                if ai_res.status_code == 200:
+                    raw_text = ai_res.json()["choices"][0]["message"]["content"].strip()
+                    # Sanitize markdown fencing
+                    if raw_text.startswith("```json"):
+                        raw_text = raw_text[7:].strip()
+                    elif raw_text.startswith("```"):
+                        raw_text = raw_text[3:].strip()
+                    if raw_text.endswith("```"):
+                        raw_text = raw_text[:-3].strip()
+
+                    payload = json.loads(raw_text)
+                    statements = payload.get("statements", [])
+                    raw_highest = max([stmt.get("severity_score", 0) for stmt in statements]) if statements else 0
+                    computed_score = round(float(max(fallback_score, raw_highest)), 1)
+                    if raw_highest > 0:
+                        verdict = "Divisive rhetoric or inflammatory statements detected."
+                else:
+                    print(f"Hate Speech API call error for {name} ({ai_res.status_code}): {ai_res.text}")
+        except Exception as e:
+            print(f"LLM evaluation failed for {name}: {str(e)}")
+
+    # 4. Multi-Key Persistence
+    if target_type and associated_id:
+        try:
+            clean_assoc = str(associated_id).strip()
+            clean_unpadded = clean_assoc.lstrip('0') if clean_assoc.lstrip('0') else '0'
+            clean_padded = clean_assoc.zfill(3)
+
+            target_ids = set([
+                clean_assoc,
+                clean_unpadded,
+                clean_padded,
+                f"inc-{target_type}-{clean_assoc}",
+                f"inc-{target_type}-{clean_unpadded}",
+                f"inc-{target_type}-{clean_padded}"
+            ])
+
+            for tid in target_ids:
+                await conn.execute(
+                    """
+                    INSERT INTO incumbent_accountability_metrics (
+                        target_type, associated_id, hate_speech_score, updated_at
+                    )
+                    VALUES ($1, $2, $3, NOW())
+                    ON CONFLICT (target_type, associated_id) 
+                    DO UPDATE SET 
+                        hate_speech_score = EXCLUDED.hate_speech_score,
+                        updated_at = NOW();
+                    """,
+                    target_type, tid, computed_score
+                )
+        except Exception as db_err:
+            print(f"Failed to persist hate speech score for {name}: {db_err}")
+
+    return {
+        "hate_speech_score": computed_score,
+        "statements": statements,
+        "verdict": verdict
+    }
+
+
+
+
+
+
+
 
 async def analyze_social_insults(name: str, role: str) -> List[SocialStatement]:
     if not name or name.strip().upper() in ["TBD", "N/A", "UNKNOWN", "NONE"]:
         return []
 
     await asyncio.sleep(1.2)
-    search_query = f'"{name.strip()}" (insult OR matusi OR kashfa OR diss OR attack OR statement)'
+    
+    search_query = f"{name.strip()} insult matusi kashfa attack statement"    
     
     snippets = []
     def _fetch_ddg(query: str):
@@ -647,18 +763,31 @@ async def analyze_social_insults(name: str, role: str) -> List[SocialStatement]:
             with DDGS(timeout=6) as ddgs:
                 return list(ddgs.text(query, max_results=8, region="ke-en"))
         except Exception as e:
+            print(f"DDG Search error for {name}: {e}")
             return []
 
     ddg_results = await asyncio.to_thread(_fetch_ddg, search_query)
     if ddg_results:
         snippets = [f"- {item.get('title', '')}: {item.get('body', '')}" for item in ddg_results if item.get("body")]
 
+    # FIXED: Proper parameter-encoded Google Fallback
     if not snippets and GOOGLE_SEARCH_API_KEY and GOOGLE_SEARCH_CX:
         try:
-            google_results = await fetch_online_intelligence(name, role, "news")
-            snippets = [f"- {item.get('title', '')}: {item.get('snippet', '')}" for item in google_results if item.get("snippet")]
-        except Exception:
-            pass
+            url = "https://customsearch.googleapis.com/customsearch/v1"
+            params = {
+                "key": GOOGLE_SEARCH_API_KEY,
+                "cx": GOOGLE_SEARCH_CX,
+                "q": search_query,
+                "num": 8
+            }
+            async with httpx.AsyncClient(timeout=8.0) as search_client:
+                search_res = await search_client.get(url, params=params)
+                if search_res.status_code == 200:
+                    data = search_res.json()
+                    if "items" in data:
+                        snippets = [f"- {item.get('title', '')}: {item.get('snippet', '')}" for item in data["items"] if item.get("snippet")]
+        except Exception as e:
+            print(f"Social insults Google Search error for {name}: {e}")
 
     context_text = "\n".join(snippets) if snippets else ""
     if not context_text:
@@ -700,6 +829,10 @@ async def analyze_social_insults(name: str, role: str) -> List[SocialStatement]:
         print(f"[Social AI] Provider limit or parsing skip for {name}: {e}")
         
     return []
+
+
+
+
 
 async def generate_live_ai_deep_dive(
     name: str, 
@@ -871,7 +1004,7 @@ def calculate_hate_speech_score(name: str, role: str, footprint_data: list = Non
     if identifier:
         hash_val = int(hashlib.md5(identifier.encode('utf-8')).hexdigest()[:6], 16)
         # Guarantees a non-zero realistic floor between 8.0% and 42.0%
-        baseline_score = 8.0 + (hash_val % 340) / 10.0
+        baseline_score = 8.0 + (hash_val % 50) / 10.0
     else:
         baseline_score = 12.0
 
@@ -1800,16 +1933,25 @@ async def process_system_scores(conn: asyncpg.Connection = Depends(get_db_connec
             s_key = (role, assoc_id)
             spatial_risk_pressure[s_key] = spatial_risk_pressure.get(s_key, 0.0) + final_velocity
 
+    # Fetch executives and append to incumbent_targets
+    executives = await conn.fetch("SELECT office_id, role FROM national_executive WHERE status = 'Active' OR status IS NULL")
+    
     counties = await conn.fetch("SELECT county_code FROM administrative_counties")
     parliaments = await conn.fetch("SELECT constituency_id FROM parliament_constituencies")
     wards = await conn.fetch("SELECT ward_id FROM local_assembly_wards")
     
     updated_incumbents_count = 0
-    incumbent_targets = [("governor", co["county_code"]) for co in counties] + \
-                        [("senator", co["county_code"]) for co in counties] + \
-                        [("women_rep", co["county_code"]) for co in counties] + \
-                        [("mp", str(p["constituency_id"])) for p in parliaments] + \
-                        [("mca", str(w["ward_id"])) for w in wards]
+    
+    incumbent_targets = []
+    for ex in executives:
+        t_type = "deputy_president" if "deputy" in ex["role"].lower() else "president"
+        incumbent_targets.append((t_type, ex["office_id"]))
+
+    incumbent_targets += [("governor", co["county_code"]) for co in counties] + \
+                         [("senator", co["county_code"]) for co in counties] + \
+                         [("women_rep", co["county_code"]) for co in counties] + \
+                         [("mp", str(p["constituency_id"])) for p in parliaments] + \
+                         [("mca", str(w["ward_id"])) for w in wards]
 
     for t_type, a_id in incumbent_targets:
         pressure_factor = spatial_risk_pressure.get((t_type, a_id), 0.0)
@@ -1836,11 +1978,11 @@ async def process_system_scores(conn: asyncpg.Connection = Depends(get_db_connec
             VALUES ($1, $2, $3, $4, $5, $6, CURRENT_TIMESTAMP)
             ON CONFLICT (target_type, associated_id) 
             DO UPDATE SET 
-                risk_radar_index = EXCLUDED.risk_radar_index,
                 jaba_meter = EXCLUDED.jaba_meter,
                 performance_score = EXCLUDED.performance_score,
+                risk_radar_index = EXCLUDED.risk_radar_index,
                 hate_speech_score = EXCLUDED.hate_speech_score,
-                updated_at = CURRENT_TIMESTAMP
+                updated_at = CURRENT_TIMESTAMP;
         """
         await conn.execute(upsert_query, t_type, a_id, computed_jaba, computed_perf, computed_risk_radar, base_hate)
         updated_incumbents_count += 1
@@ -2030,60 +2172,52 @@ async def dispatch_via_router(
     temperature: float = 0.2
 ) -> dict:
     start_time = time.time()
-    
-    selected_engine, probs = ai_router.route_query(ctx, current_backend_metrics)
     policy_eval_latency = time.time() - start_time
-    
-    headers = {"Content-Type": "application/json"}
+
+    # Explicitly enforce valid HTTP/HTTPS base URL
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {OPENAI_API_KEY}"
+    }
+
+    # Bound prompt content length to prevent context limit errors
+    safe_user_content = user_content[:3000] if len(user_content) > 3000 else user_content
+
     payload = {
+        "model": OPENAI_MODEL if OPENAI_MODEL else "gpt-4o-mini",
         "messages": [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_content}
+            {"role": "user", "content": safe_user_content}
         ],
         "temperature": temperature,
-        "response_format": {"type": "json_object"}
+        "max_tokens": 800
     }
-    
-    inference_start = time.time()
-    
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        if selected_engine == "gemini_core":
-            url = "https://api.openai.com/v1/chat/completions"
-            headers["Authorization"] = f"Bearer {OPENAI_API_KEY}"
-            payload["model"] = OPENAI_MODEL
-            cost_factor = current_backend_metrics.cost_per_1k_tokens["gemini_core"]
-            
-        elif selected_engine == "grok_core":
-            url = "https://api.groq.com/openai/v1/chat/completions"
-            headers["Authorization"] = f"Bearer {GROQ_API_KEY}"
-            payload["model"] = "openai/gpt-oss-20b" 
-            cost_factor = current_backend_metrics.cost_per_1k_tokens["grok_core"]
-            
-        else:
-            url = "https://api.groq.com/openai/v1/chat/completions"
-            headers["Authorization"] = f"Bearer {GROQ_API_KEY}"
-            payload["model"] = "openai/gpt-oss-120b"
-            cost_factor = current_backend_metrics.cost_per_1k_tokens["llama_core"]
 
+    inference_start = time.time()
+
+    async with httpx.AsyncClient(timeout=12.0) as client:
         response = await client.post(url, headers=headers, json=payload)
         target_inference_latency = time.time() - inference_start
-        
-        confidence = probs.get(selected_engine, 1.0) if isinstance(probs, dict) else 1.0
-        override_reason = probs.get("override", "none") if isinstance(probs, dict) else "none"
-        
-        record_routing_decision(
-            engine=selected_engine,
-            confidence=confidence,
-            override_reason=override_reason,
-            policy_latency_sec=policy_eval_latency,
-            target_latency_sec=target_inference_latency,
-            cost_usd=cost_factor
-        )
-        
+
         if response.status_code == 200:
-            return json.loads(response.json()["choices"][0]["message"]["content"].strip())
+            raw_text = response.json()["choices"][0]["message"]["content"].strip()
+            # Strip markdown code fencing if present
+            if raw_text.startswith("```json"):
+                raw_text = raw_text[7:].strip()
+            elif raw_text.startswith("```"):
+                raw_text = raw_text[3:].strip()
+            if raw_text.endswith("```"):
+                raw_text = raw_text[:-3].strip()
+
+            return json.loads(raw_text)
         else:
-            raise Exception(f"AI Provider Error [{selected_engine}] {response.status_code}: {response.text}")
+            raise Exception(f"AI Provider Error [openai_core] {response.status_code}: {response.text}")
+
+
+
+
+
 
 # --- JOURNALIST INTEL INTAKE ---
 @app.post(
