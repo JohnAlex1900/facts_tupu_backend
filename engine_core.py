@@ -70,35 +70,77 @@ async def _search_online(query: str, max_results: int = 5) -> List[Dict[str, Any
             async with httpx.AsyncClient(timeout=8.0) as client:
                 response = await client.get(url, params=params)
             if response.status_code != 200:
+                try:
+                    error_data = response.json().get("error", {})
+                    reasons = ", ".join(
+                        str(item.get("reason"))
+                        for item in error_data.get("errors", [])
+                        if item.get("reason")
+                    )
+                    message = str(error_data.get("message", ""))
+                except (ValueError, AttributeError):
+                    reasons = ""
+                    message = response.text[:300]
                 print(
-                    f"Google Custom Search failed with HTTP "
-                    f"{response.status_code} for query: {query}"
+                    f"Google Custom Search rejected the request "
+                    f"(HTTP {response.status_code}"
+                    f"{f', reason={reasons}' if reasons else ''}): "
+                    f"{message[:300] or 'No error message returned'}"
                 )
-                return []
-
-            data = response.json()
-            if "error" in data:
-                error = data["error"]
-                print(
-                    "Google Custom Search API error "
-                    f"{error.get('code', 'unknown')}: "
-                    f"{str(error.get('message', 'Unknown API error'))[:300]}"
-                )
-                return []
-            return [
-                {
-                    "title": item.get("title", ""),
-                    "snippet": item.get("snippet", "")
-                }
-                for item in data.get("items", [])
-                if item.get("snippet")
-            ]
+            else:
+                data = response.json()
+                items = data.get("items", [])
+                results = [
+                    {
+                        "title": item.get("title", ""),
+                        "snippet": item.get("snippet", "")
+                    }
+                    for item in items
+                    if item.get("snippet")
+                ]
+                if results:
+                    return results
+                print("Google Custom Search returned no usable snippets.")
         except Exception as exc:
             print(
-                f"Google Custom Search request failed for query "
-                f"'{query}': {type(exc).__name__}"
+                "Google Custom Search request failed: "
+                f"{type(exc).__name__}"
             )
-            return []
+
+    if SERPAPI_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.get(
+                    "https://serpapi.com/search.json",
+                    params={
+                        "engine": "google",
+                        "q": query,
+                        "num": min(max_results, 10),
+                        "api_key": SERPAPI_API_KEY,
+                    }
+                )
+            if response.status_code == 200:
+                data = response.json()
+                if data.get("error"):
+                    print(f"SerpAPI search failed: {str(data['error'])[:300]}")
+                else:
+                    results = [
+                        {
+                            "title": item.get("title", ""),
+                            "snippet": item.get("snippet", "")
+                        }
+                        for item in data.get("organic_results", [])
+                        if item.get("snippet")
+                    ]
+                    if results:
+                        return results
+            else:
+                print(f"SerpAPI search failed with HTTP {response.status_code}.")
+        except Exception as exc:
+            print(
+                f"SerpAPI search request failed: "
+                f"{type(exc).__name__}"
+            )
 
     ddg_results = await asyncio.to_thread(
         _fetch_duckduckgo,
@@ -999,6 +1041,7 @@ async def system_health_check():
         "database_pool": "CONNECTED" if db.pool else "DISCONNECTED",
         "ai_provider_configured": bool(OPENAI_API_KEY),
         "google_search_configured": bool(GOOGLE_SEARCH_API_KEY and GOOGLE_SEARCH_CX),
+        "serpapi_search_configured": bool(SERPAPI_API_KEY),
         "duckduckgo_fallback_enabled": True
     }
 
