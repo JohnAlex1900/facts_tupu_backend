@@ -47,9 +47,16 @@ OPENAI_MODEL = os.getenv("MONITOR_AI_MODEL", "gpt-4o-mini")
 GOOGLE_SEARCH_API_KEY = os.getenv("GOOGLE_SEARCH_API_KEY", "")
 GOOGLE_SEARCH_CX = os.getenv("GOOGLE_SEARCH_CX", "")
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-
 # --- HELPER UTILITIES ---
+def _fetch_duckduckgo(query: str, max_results: int = 5) -> List[Dict[str, Any]]:
+    try:
+        with DDGS(timeout=8) as ddgs:
+            return list(ddgs.text(query, max_results=max_results, region="wt-wt"))
+    except Exception as exc:
+        print(f"DuckDuckGo search failed: {exc}")
+        return []
+
+
 def get_password_hash(password: str) -> str:
     password_bytes = password.encode('utf-8')
     salt = bcrypt.gensalt()
@@ -317,28 +324,48 @@ class DynamicScoreSyncRequest(BaseModel):
 
 # --- LIVE INTELLIGENCE & AI SERVICES ---
 async def fetch_online_intelligence(candidate_name: str, role: str, affiliation: str) -> List[Dict[str, Any]]:
-    if not GOOGLE_SEARCH_API_KEY or not GOOGLE_SEARCH_CX:
-        return []
+    search_query = f'"{candidate_name}" {role} {affiliation} news {datetime.now().year}'
 
-    search_query = f'"{candidate_name}" {role} {affiliation} news 2026'
-    url = f"https://customsearch.googleapis.com/customsearch/v1?key={GOOGLE_SEARCH_API_KEY}&cx={GOOGLE_SEARCH_CX}&q={search_query}&num=4"
+    if GOOGLE_SEARCH_API_KEY and GOOGLE_SEARCH_CX:
+        url = "https://customsearch.googleapis.com/customsearch/v1"
+        params = {
+            "key": GOOGLE_SEARCH_API_KEY,
+            "cx": GOOGLE_SEARCH_CX,
+            "q": search_query,
+            "num": 4
+        }
+        try:
+            async with httpx.AsyncClient(timeout=8.0) as client:
+                response = await client.get(url, params=params)
+                if response.status_code == 200:
+                    data = response.json()
+                    items = data.get("items", [])
+                    if items:
+                        return [
+                            {
+                                "title": item.get("title", ""),
+                                "snippet": item.get("snippet", "")
+                            }
+                            for item in items
+                            if item.get("snippet")
+                        ]
+                else:
+                    print(
+                        f"Google Search returned {response.status_code} "
+                        f"for {candidate_name}: {response.text}"
+                    )
+        except Exception as exc:
+            print(f"Google Search failed for {candidate_name}: {exc}")
 
-    try:
-        async with httpx.AsyncClient(timeout=4.5) as client:
-            response = await client.get(url)
-            if response.status_code == 200:
-                data = response.json()
-                formatted_results = []
-                if "items" in data:
-                    for item in data["items"]:
-                        formatted_results.append({
-                            "title": item.get("title", ""),
-                            "snippet": item.get("snippet", "")
-                        })
-                return formatted_results
-    except Exception as e:
-        print(f"Web intelligence scraping error for {candidate_name}: {str(e)}")
-    return []
+    ddg_results = await asyncio.to_thread(_fetch_duckduckgo, search_query, 4)
+    return [
+        {
+            "title": item.get("title", ""),
+            "snippet": item.get("body", "")
+        }
+        for item in ddg_results
+        if item.get("body")
+    ]
 
 async def analyze_signals_with_ai(candidate_name: str, search_snippets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     if not OPENAI_API_KEY or not search_snippets:
@@ -425,20 +452,19 @@ async def analyze_representative_deep_dive(c: Dict[str, Any]) -> Dict[str, Any]:
         "sentiment_label": "STABLE"
     }
 
-    if not GROQ_API_KEY:
+    if not OPENAI_API_KEY:
         return fallback_response
 
     try:
         search_query = f"{full_name} {location} {target_role} Kenya news development"
         
-        # 1. Try DDGS first
-        try:
-            with DDGS() as ddgs:
-                ddg_results = list(ddgs.text(search_query, max_results=5, region="wt-wt"))
-                snippets = [f"- {item.get('title', '')}: {item.get('body', '')}" for item in ddg_results if item.get("body")]
-        except Exception as e:
-            print(f"DDGS Search Error for {full_name}: {e}")
-            snippets = []
+        # 1. Try DuckDuckGo without blocking the async request loop.
+        ddg_results = await asyncio.to_thread(_fetch_duckduckgo, search_query, 5)
+        snippets = [
+            f"- {item.get('title', '')}: {item.get('body', '')}"
+            for item in ddg_results
+            if item.get("body")
+        ]
 
         # 2. Add Google Search Fallback for deployed cloud environments
         if not snippets and GOOGLE_SEARCH_API_KEY and GOOGLE_SEARCH_CX:
@@ -989,7 +1015,10 @@ async def generate_live_ai_deep_dive(
 async def system_health_check():
     return {
         "engine_status": "ONLINE",
-        "database_pool": "CONNECTED" if db.pool else "DISCONNECTED"
+        "database_pool": "CONNECTED" if db.pool else "DISCONNECTED",
+        "ai_provider_configured": bool(OPENAI_API_KEY),
+        "google_search_configured": bool(GOOGLE_SEARCH_API_KEY and GOOGLE_SEARCH_CX),
+        "duckduckgo_fallback_enabled": True
     }
 
 def evaluate_nlp_severity(footprint_data: list) -> float:
@@ -2338,7 +2367,7 @@ async def get_live_monitor_stream(conn: asyncpg.Connection = Depends(get_db_conn
     """
     candidates = await conn.fetch(candidate_query)
 
-    if candidates and GOOGLE_SEARCH_API_KEY and GOOGLE_SEARCH_CX and OPENAI_API_KEY:
+    if candidates and OPENAI_API_KEY:
         search_tasks = [
             fetch_online_intelligence(c["full_name"], c["target_role"], c["party_affiliation"])
             for c in candidates
@@ -2347,16 +2376,17 @@ async def get_live_monitor_stream(conn: asyncpg.Connection = Depends(get_db_conn
         all_snippets = await asyncio.gather(*search_tasks, return_exceptions=True)
         
         ai_tasks = []
+        ai_candidates = []
         for idx, snippets in enumerate(all_snippets):
             if snippets and not isinstance(snippets, Exception):
                 c = candidates[idx]
                 ai_tasks.append(analyze_signals_with_ai(c["full_name"], snippets)) # pyright: ignore[reportArgumentType]
-        
+                ai_candidates.append(c)
+
         all_ai_events = await asyncio.gather(*ai_tasks, return_exceptions=True)
 
-        for c_idx, ai_events in enumerate(all_ai_events):
+        for c, ai_events in zip(ai_candidates, all_ai_events):
             if ai_events and not isinstance(ai_events, Exception):
-                c = candidates[c_idx]
                 for idx, event in enumerate(ai_events): # pyright: ignore[reportArgumentType]
                     events_payload.append(
                         LiveMonitorEvent(
