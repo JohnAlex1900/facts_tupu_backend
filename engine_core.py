@@ -397,7 +397,7 @@ async def analyze_signals_with_ai(candidate_name: str, search_snippets: List[Dic
                 if isinstance(parsed, list):
                     return parsed
     except Exception as e:
-        print(f"AI classification processing failure for {candidate_name}: {str(e)}")
+        print(f"AI classification processing has failed for {candidate_name}: {str(e)}")
     return []
 
 async def analyze_representative_deep_dive(c: Dict[str, Any]) -> Dict[str, Any]:
