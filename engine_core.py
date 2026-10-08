@@ -341,7 +341,7 @@ async def fetch_online_intelligence(candidate_name: str, role: str, affiliation:
                     data = response.json()
                     items = data.get("items", [])
                     if items:
-                        return [
+                        formatted_results = [
                             {
                                 "title": item.get("title", ""),
                                 "snippet": item.get("snippet", "")
@@ -349,6 +349,8 @@ async def fetch_online_intelligence(candidate_name: str, role: str, affiliation:
                             for item in items
                             if item.get("snippet")
                         ]
+                        if formatted_results:
+                            return formatted_results
                 else:
                     print(
                         f"Google Search returned {response.status_code} "
@@ -632,43 +634,16 @@ async def analyze_live_hate_speech(
     fallback_score = calculate_hate_speech_score(name, role, [])
     target_type, associated_id = await resolve_leader_id_async(conn, leader_id, role, name)
 
-    snippets = []
-    search_query = f'"{name}" {role} controversy insult statement Kenya news'
-
-    # 1. Search via DuckDuckGo with timeout protection
-    def _fetch_ddg():
-        try:
-            with DDGS(timeout=4) as ddgs:
-                return list(ddgs.text(search_query, max_results=5, region="wt-wt"))
-        except Exception as e:
-            print(f"DDG Search bypass for {name}: {e}")
-            return []
-
-    try:
-        ddg_results = await asyncio.to_thread(_fetch_ddg)
-        if ddg_results:
-            snippets = [f"- {item.get('title', '')}: {item.get('body', '')}" for item in ddg_results if item.get("body")]
-    except Exception as e:
-        print(f"Hate speech search execution error for {name}: {e}")
-
-    # 2. Search Fallback via Google Custom Search API
-    if not snippets and GOOGLE_SEARCH_API_KEY and GOOGLE_SEARCH_CX:
-        try:
-            url = "https://customsearch.googleapis.com/customsearch/v1"
-            params = {
-                "key": GOOGLE_SEARCH_API_KEY,
-                "cx": GOOGLE_SEARCH_CX,
-                "q": search_query,
-                "num": 5
-            }
-            async with httpx.AsyncClient(timeout=6.0) as search_client:
-                search_res = await search_client.get(url, params=params)
-                if search_res.status_code == 200:
-                    data = search_res.json()
-                    if "items" in data:
-                        snippets = [f"- {item.get('title', '')}: {item.get('snippet', '')}" for item in data["items"] if item.get("snippet")]
-        except Exception as e:
-            print(f"Google Search fallback error for {name}: {e}")
+    search_results = await fetch_online_intelligence(
+        name,
+        role,
+        "political remarks statements controversy"
+    )
+    snippets = [
+        f"- {item.get('title', '')}: {item.get('snippet', '')}"
+        for item in search_results
+        if item.get("snippet")
+    ]
 
     # Safe context capping (prevents message length 400 errors)
     raw_context = "\n".join(snippets) if snippets else ""
@@ -676,12 +651,16 @@ async def analyze_live_hate_speech(
 
     computed_score = fallback_score
     statements = []
-    verdict = "No significant hate speech or inciting rhetoric flagged in recent public recordings."
+    analysis_status = "no_search_results"
+    verdict = "No search evidence was available to assess hate speech or inciting rhetoric."
 
-    # 3. Explicit OpenAI Evaluation (Hardcoded HTTPS Endpoint)
+    # Evaluate only when there is actual search evidence.
     openai_endpoint = "https://api.openai.com/v1/chat/completions"
 
-    if OPENAI_API_KEY and context_text:
+    if context_text and not OPENAI_API_KEY:
+        analysis_status = "ai_not_configured"
+        verdict = "Search evidence was found, but AI analysis is not configured."
+    elif context_text:
         system_prompt = (
             "You are a strict, factual political analysis engine.\n"
             "Analyze the search snippets for the representative. Extract exact quotes or statements representing hate speech, political insults, or inflammatory rhetoric.\n"
@@ -732,18 +711,44 @@ async def analyze_live_hate_speech(
                         raw_text = raw_text[:-3].strip()
 
                     payload = json.loads(raw_text)
-                    statements = payload.get("statements", [])
-                    raw_highest = max([stmt.get("severity_score", 0) for stmt in statements]) if statements else 0
+                    parsed_statements = payload.get("statements", [])
+                    if not isinstance(parsed_statements, list):
+                        raise ValueError("AI response field 'statements' must be a list.")
+                    statements = [
+                        statement for statement in parsed_statements
+                        if isinstance(statement, dict)
+                    ]
+                    raw_highest = max(
+                        (
+                            max(0.0, min(100.0, float(statement.get("severity_score", 0))))
+                            for statement in statements
+                        ),
+                        default=0.0
+                    )
                     computed_score = round(float(max(fallback_score, raw_highest)), 1)
-                    if raw_highest > 0:
+                    if statements:
+                        analysis_status = "findings"
                         verdict = "Divisive rhetoric or inflammatory statements detected."
+                    else:
+                        analysis_status = "analyzed_no_findings"
+                        verdict = "Search evidence was analyzed; no qualifying statements were identified."
                 else:
-                    print(f"Hate Speech API call error for {name} ({ai_res.status_code}): {ai_res.text}")
+                    analysis_status = "ai_error"
+                    verdict = "Search evidence was found, but AI analysis failed."
+                    print(
+                        f"Hate speech API call failed for {name} "
+                        f"({ai_res.status_code}): {ai_res.text}"
+                    )
         except Exception as e:
-            print(f"LLM evaluation failed for {name}: {str(e)}")
-
+            analysis_status = "ai_error"
+            verdict = "Search evidence was found, but AI analysis failed."
+            print(f"Hate speech AI analysis failed for {name}: {e}")
     # 4. Multi-Key Persistence
-    if target_type and associated_id:
+    if (
+        target_type
+        and associated_id
+        and analysis_status in {"findings", "analyzed_no_findings"}
+    ):
         try:
             clean_assoc = str(associated_id).strip()
             clean_unpadded = clean_assoc.lstrip('0') if clean_assoc.lstrip('0') else '0'
@@ -778,7 +783,9 @@ async def analyze_live_hate_speech(
     return {
         "hate_speech_score": computed_score,
         "statements": statements,
-        "verdict": verdict
+        "verdict": verdict,
+        "analysis_status": analysis_status,
+        "search_results_count": len(search_results)
     }
 
 
@@ -1025,13 +1032,27 @@ def evaluate_nlp_severity(footprint_data: list) -> float:
     if not footprint_data:
         return 0.0
 
+    severity_scores = {
+        "LOW": 25.0,
+        "MODERATE": 50.0,
+        "MEDIUM": 50.0,
+        "HIGH": 75.0,
+        "CRITICAL": 95.0,
+    }
     severities = []
     for item in footprint_data:
         if isinstance(item, dict):
-            score = item.get("severity_score", item.get("score", 0.0))
+            score = item.get("severity_score", item.get("score"))
+            if score is None:
+                score = severity_scores.get(str(item.get("severity", "")).upper(), 0.0)
         else:
-            score = getattr(item, "severity_score", getattr(item, "score", 0.0))
-        severities.append(float(score))
+            score = getattr(item, "severity_score", getattr(item, "score", None))
+            if score is None:
+                score = severity_scores.get(str(getattr(item, "severity", "")).upper(), 0.0)
+        try:
+            severities.append(float(score))
+        except (TypeError, ValueError):
+            severities.append(0.0)
 
     if not severities:
         return 0.0
@@ -1160,7 +1181,11 @@ async def sync_dynamic_representative_scores(
         except Exception:
             social_statements = []
 
-        hate_score = calculate_hate_speech_score(full_name, t_type, social_statements)
+        hate_score = (
+            calculate_hate_speech_score(full_name, t_type, social_statements)
+            if social_statements
+            else None
+        )
 
         intel_count = await conn.fetchval(
             "SELECT COUNT(*) FROM journalist_intel_reports WHERE target_type = $1 AND associated_id = $2",
@@ -1173,7 +1198,7 @@ async def sync_dynamic_representative_scores(
         base_jaba = min(15 + (hash_seed % 35) + (intel_count * 5), 95)
         base_impact = max(85 - (hash_seed % 25) - (intel_count * 3), 20)
         
-        hate_risk_penalty = int(hate_score * 0.45)
+        hate_risk_penalty = int((hate_score or 0.0) * 0.45)
         raw_risk = 10 + (hash_seed % 20) + (intel_count * 12) + hate_risk_penalty
         base_risk = min(max(raw_risk, 10), 98)
 
@@ -1188,7 +1213,10 @@ async def sync_dynamic_representative_scores(
             jaba_meter = EXCLUDED.jaba_meter,
             performance_score = EXCLUDED.performance_score,
             risk_radar_index = EXCLUDED.risk_radar_index,
-            hate_speech_score = EXCLUDED.hate_speech_score,
+            hate_speech_score = COALESCE(
+                EXCLUDED.hate_speech_score,
+                incumbent_accountability_metrics.hate_speech_score
+            ),
             updated_at = CURRENT_TIMESTAMP;
     """
         
@@ -2023,7 +2051,10 @@ async def process_system_scores(conn: asyncpg.Connection = Depends(get_db_connec
                 jaba_meter = EXCLUDED.jaba_meter,
                 performance_score = EXCLUDED.performance_score,
                 risk_radar_index = EXCLUDED.risk_radar_index,
-                hate_speech_score = EXCLUDED.hate_speech_score,
+                hate_speech_score = COALESCE(
+                    incumbent_accountability_metrics.hate_speech_score,
+                    EXCLUDED.hate_speech_score
+                ),
                 updated_at = CURRENT_TIMESTAMP;
         """
         await conn.execute(upsert_query, t_type, a_id, computed_jaba, computed_perf, computed_risk_radar, base_hate)
