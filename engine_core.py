@@ -57,6 +57,64 @@ def _fetch_duckduckgo(query: str, max_results: int = 5) -> List[Dict[str, Any]]:
         return []
 
 
+async def _search_online(query: str, max_results: int = 5) -> List[Dict[str, Any]]:
+    if GOOGLE_SEARCH_API_KEY and GOOGLE_SEARCH_CX:
+        url = "https://customsearch.googleapis.com/customsearch/v1"
+        params = {
+            "key": GOOGLE_SEARCH_API_KEY,
+            "cx": GOOGLE_SEARCH_CX,
+            "q": query,
+            "num": min(max_results, 10)
+        }
+        try:
+            async with httpx.AsyncClient(timeout=8.0) as client:
+                response = await client.get(url, params=params)
+            if response.status_code != 200:
+                print(
+                    f"Google Custom Search failed with HTTP "
+                    f"{response.status_code} for query: {query}"
+                )
+                return []
+
+            data = response.json()
+            if "error" in data:
+                error = data["error"]
+                print(
+                    "Google Custom Search API error "
+                    f"{error.get('code', 'unknown')}: "
+                    f"{str(error.get('message', 'Unknown API error'))[:300]}"
+                )
+                return []
+            return [
+                {
+                    "title": item.get("title", ""),
+                    "snippet": item.get("snippet", "")
+                }
+                for item in data.get("items", [])
+                if item.get("snippet")
+            ]
+        except Exception as exc:
+            print(
+                f"Google Custom Search request failed for query "
+                f"'{query}': {type(exc).__name__}"
+            )
+            return []
+
+    ddg_results = await asyncio.to_thread(
+        _fetch_duckduckgo,
+        query,
+        max_results
+    )
+    return [
+        {
+            "title": item.get("title", ""),
+            "snippet": item.get("body", "")
+        }
+        for item in ddg_results
+        if item.get("body")
+    ]
+
+
 def get_password_hash(password: str) -> str:
     password_bytes = password.encode('utf-8')
     salt = bcrypt.gensalt()
@@ -325,49 +383,7 @@ class DynamicScoreSyncRequest(BaseModel):
 # --- LIVE INTELLIGENCE & AI SERVICES ---
 async def fetch_online_intelligence(candidate_name: str, role: str, affiliation: str) -> List[Dict[str, Any]]:
     search_query = f'"{candidate_name}" {role} {affiliation} news {datetime.now().year}'
-
-    if GOOGLE_SEARCH_API_KEY and GOOGLE_SEARCH_CX:
-        url = "https://customsearch.googleapis.com/customsearch/v1"
-        params = {
-            "key": GOOGLE_SEARCH_API_KEY,
-            "cx": GOOGLE_SEARCH_CX,
-            "q": search_query,
-            "num": 4
-        }
-        try:
-            async with httpx.AsyncClient(timeout=8.0) as client:
-                response = await client.get(url, params=params)
-                if response.status_code == 200:
-                    data = response.json()
-                    items = data.get("items", [])
-                    if items:
-                        formatted_results = [
-                            {
-                                "title": item.get("title", ""),
-                                "snippet": item.get("snippet", "")
-                            }
-                            for item in items
-                            if item.get("snippet")
-                        ]
-                        if formatted_results:
-                            return formatted_results
-                else:
-                    print(
-                        f"Google Search returned {response.status_code} "
-                        f"for {candidate_name}: {response.text}"
-                    )
-        except Exception as exc:
-            print(f"Google Search failed for {candidate_name}: {exc}")
-
-    ddg_results = await asyncio.to_thread(_fetch_duckduckgo, search_query, 4)
-    return [
-        {
-            "title": item.get("title", ""),
-            "snippet": item.get("body", "")
-        }
-        for item in ddg_results
-        if item.get("body")
-    ]
+    return await _search_online(search_query, max_results=4)
 
 async def analyze_signals_with_ai(candidate_name: str, search_snippets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     if not OPENAI_API_KEY or not search_snippets:
@@ -460,26 +476,11 @@ async def analyze_representative_deep_dive(c: Dict[str, Any]) -> Dict[str, Any]:
     try:
         search_query = f"{full_name} {location} {target_role} Kenya news development"
         
-        # 1. Try DuckDuckGo without blocking the async request loop.
-        ddg_results = await asyncio.to_thread(_fetch_duckduckgo, search_query, 5)
+        search_results = await _search_online(search_query, max_results=5)
         snippets = [
-            f"- {item.get('title', '')}: {item.get('body', '')}"
-            for item in ddg_results
-            if item.get("body")
+            f"- {item.get('title', '')}: {item.get('snippet', '')}"
+            for item in search_results
         ]
-
-        # 2. Add Google Search Fallback for deployed cloud environments
-        if not snippets and GOOGLE_SEARCH_API_KEY and GOOGLE_SEARCH_CX:
-            try:
-                url = "https://customsearch.googleapis.com/customsearch/v1"
-                params = {"key": GOOGLE_SEARCH_API_KEY, "cx": GOOGLE_SEARCH_CX, "q": search_query, "num": 5}
-                async with httpx.AsyncClient(timeout=6.0) as search_client:
-                    search_res = await search_client.get(url, params=params)
-                    if search_res.status_code == 200:
-                        data = search_res.json()
-                        snippets = [f"- {item.get('title', '')}: {item.get('snippet', '')}" for item in data.get("items", []) if item.get("snippet")]
-            except Exception as e:
-                print(f"Google Search fallback error: {e}")
 
         context_text = "\n".join(snippets) if snippets else "No recent organic search results found."
 
@@ -801,39 +802,12 @@ async def analyze_social_insults(name: str, role: str) -> List[SocialStatement]:
 
     await asyncio.sleep(1.2)
     
-    search_query = f"{name.strip()} insult matusi kashfa attack statement"    
-    
-    snippets = []
-    def _fetch_ddg(query: str):
-        try:
-            with DDGS(timeout=6) as ddgs:
-                return list(ddgs.text(query, max_results=8, region="ke-en"))
-        except Exception as e:
-            print(f"DDG Search error for {name}: {e}")
-            return []
-
-    ddg_results = await asyncio.to_thread(_fetch_ddg, search_query)
-    if ddg_results:
-        snippets = [f"- {item.get('title', '')}: {item.get('body', '')}" for item in ddg_results if item.get("body")]
-
-    # FIXED: Proper parameter-encoded Google Fallback
-    if not snippets and GOOGLE_SEARCH_API_KEY and GOOGLE_SEARCH_CX:
-        try:
-            url = "https://customsearch.googleapis.com/customsearch/v1"
-            params = {
-                "key": GOOGLE_SEARCH_API_KEY,
-                "cx": GOOGLE_SEARCH_CX,
-                "q": search_query,
-                "num": 8
-            }
-            async with httpx.AsyncClient(timeout=8.0) as search_client:
-                search_res = await search_client.get(url, params=params)
-                if search_res.status_code == 200:
-                    data = search_res.json()
-                    if "items" in data:
-                        snippets = [f"- {item.get('title', '')}: {item.get('snippet', '')}" for item in data["items"] if item.get("snippet")]
-        except Exception as e:
-            print(f"Social insults Google Search error for {name}: {e}")
+    search_query = f"{name.strip()} {role} insult matusi kashfa attack statement"
+    search_results = await _search_online(search_query, max_results=8)
+    snippets = [
+        f"- {item.get('title', '')}: {item.get('snippet', '')}"
+        for item in search_results
+    ]
 
     context_text = "\n".join(snippets) if snippets else ""
     if not context_text:
