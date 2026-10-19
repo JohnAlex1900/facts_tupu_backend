@@ -162,7 +162,7 @@ async def sync_all_representatives():
 
             -- 5. Members of Parliament (Constituencies)
             SELECT 
-                'inc-mp-' || pc.constituency_id AS id,
+                'INC-MP-' || pc.constituency_code AS id,
                 pc.mp_name AS name,
                 'Member of Parliament' AS role,
                 co.county_name AS county,
@@ -171,14 +171,15 @@ async def sync_all_representatives():
                 COALESCE(m.risk_radar_index, 10) AS rvs
             FROM parliament_constituencies pc
             JOIN administrative_counties co ON pc.county_code = co.county_code
-            LEFT JOIN incumbent_accountability_metrics m ON m.target_type = 'mp' AND m.associated_id = CAST(pc.constituency_id AS text)
-            WHERE pc.mp_name IS NOT NULL AND TRIM(pc.mp_name) != ''
+            LEFT JOIN incumbent_accountability_metrics m ON m.target_type = 'mp' AND m.associated_id = pc.constituency_code
+            WHERE pc.constituency_code IS NOT NULL
+              AND pc.mp_name IS NOT NULL AND TRIM(pc.mp_name) != ''
 
             UNION ALL
 
             -- 6. Members of County Assembly (Wards)
             SELECT 
-                'inc-mca-' || law.ward_id AS id,
+                'INC-MCA-' || law.ward_code AS id,
                 law.mca_name AS name,
                 'Member of County Assembly' AS role,
                 co.county_name AS county,
@@ -187,8 +188,11 @@ async def sync_all_representatives():
                 COALESCE(m.risk_radar_index, 10) AS rvs
             FROM local_assembly_wards law
             JOIN administrative_counties co ON law.county_code = co.county_code
-            LEFT JOIN incumbent_accountability_metrics m ON m.target_type = 'mca' AND m.associated_id = CAST(law.ward_id AS text)
-            WHERE law.mca_name IS NOT NULL AND TRIM(law.mca_name) != ''
+            LEFT JOIN incumbent_accountability_metrics m
+                ON m.target_type = 'mca'
+               AND m.associated_id = law.ward_code
+            WHERE law.ward_code IS NOT NULL
+              AND law.mca_name IS NOT NULL AND TRIM(law.mca_name) != ''
         """
         
         async with pool.acquire() as conn:

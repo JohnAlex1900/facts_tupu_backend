@@ -16,11 +16,12 @@ class DatabaseManager:
         if not DATABASE_URL:
             raise ValueError("FATAL: SUPABASE_DATABASE_URL is missing from environment variables.")
         
-        # Create a connection pool (min 5, max 20 connections)
+        # The configured Supabase pooler currently accepts one concurrent session.
         self.pool = await asyncpg.create_pool(
             dsn=DATABASE_URL,
-            min_size=5,
-            max_size=20,
+            min_size=1,
+            max_size=1,
+            timeout=15,
             command_timeout=60
         )
         print("✅ Database connection pool established.")

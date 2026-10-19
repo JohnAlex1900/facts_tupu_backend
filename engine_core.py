@@ -1,13 +1,20 @@
 import asyncio
 from datetime import datetime, timezone
-import hashlib
+from html import unescape
+from html.parser import HTMLParser
+import ipaddress
 import io
 import json
+import logging
 import os
+import re
+import socket
 from contextlib import asynccontextmanager
 from enum import Enum
 from typing import Any, Dict, List, Optional
 import uuid
+import xml.etree.ElementTree as ET
+from urllib.parse import parse_qs, unquote, urljoin, urlparse
 from dotenv import load_dotenv
 
 import asyncpg
@@ -17,17 +24,19 @@ from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFi
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 import httpx
+from groq import AsyncGroq
 from pydantic import BaseModel, EmailStr, Field, field_validator
 from pypdf import PdfReader
 
 from database import db, get_db_connection
 
 load_dotenv()  # Load environment variables from .env file
+logger = logging.getLogger(__name__)
 
 import time
 import torch
 from router_policy import RouterPolicyNetwork, EngineRouter, QueryContext, BackendMetrics
-from metrics import record_routing_decision, start_metrics_server
+from metrics import start_metrics_server
 
 # --- ROUTER STATE INITIALIZATION ---
 policy_nn = RouterPolicyNetwork(embed_dim=768)
@@ -40,121 +49,338 @@ current_backend_metrics = BackendMetrics(
 )
 
 # --- CONFIGURATION & ENV VARS ---
-SERPAPI_API_KEY = os.getenv("SERPAPI_API_KEY", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("MONITOR_AI_MODEL", "gpt-4o-mini")
-
-GOOGLE_SEARCH_API_KEY = os.getenv("GOOGLE_SEARCH_API_KEY", "")
-GOOGLE_SEARCH_CX = os.getenv("GOOGLE_SEARCH_CX", "")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
+groq_client = AsyncGroq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+HATE_SPEECH_CACHE_TTL_SECONDS = 60 * 60
+hate_speech_analysis_cache: Dict[
+    tuple[str, str], tuple[float, Dict[str, Any]]
+] = {}
 
 # --- HELPER UTILITIES ---
 def _fetch_duckduckgo(query: str, max_results: int = 5) -> List[Dict[str, Any]]:
     try:
-        with DDGS(timeout=8) as ddgs:
-            return list(ddgs.text(query, max_results=max_results, region="wt-wt"))
+        with DDGS(timeout=4) as ddgs:
+            return list(
+                ddgs.text(
+                    query,
+                    max_results=max_results,
+                    region="wt-wt",
+                    backend="duckduckgo",
+                )
+            )
     except Exception as exc:
-        print(f"DuckDuckGo search failed: {exc}")
+        if "no results found" in str(exc).casefold():
+            logger.debug("DuckDuckGo returned no results for query %r", query[:120])
+        else:
+            logger.warning(
+                "DuckDuckGo search failed for query %r: %s",
+                query[:120],
+                exc,
+            )
         return []
 
 
-async def _search_online(query: str, max_results: int = 5) -> List[Dict[str, Any]]:
-    if GOOGLE_SEARCH_API_KEY and GOOGLE_SEARCH_CX:
-        url = "https://customsearch.googleapis.com/customsearch/v1"
-        params = {
-            "key": GOOGLE_SEARCH_API_KEY,
-            "cx": GOOGLE_SEARCH_CX,
-            "q": query,
-            "num": min(max_results, 10)
-        }
-        try:
-            async with httpx.AsyncClient(timeout=8.0) as client:
-                response = await client.get(url, params=params)
-            if response.status_code != 200:
+def _fetch_ddgs_auto(query: str, max_results: int = 5) -> List[Dict[str, Any]]:
+    try:
+        with DDGS(timeout=4) as ddgs:
+            return list(
+                ddgs.text(
+                    query,
+                    max_results=max_results,
+                    region="wt-wt",
+                    backend="auto",
+                )
+            )
+    except Exception as exc:
+        if "no results found" not in str(exc).casefold():
+            logger.warning("DDGS automatic search failed for query %r: %s", query[:120], exc)
+        return []
+
+
+def _extract_article_paragraphs(html: str) -> str:
+    class _ArticleTextExtractor(HTMLParser):
+        _ignored_tags = {"script", "style", "nav", "header", "footer", "aside", "form"}
+
+        def __init__(self) -> None:
+            super().__init__(convert_charrefs=True)
+            self.ignored_depth = 0
+            self.paragraph_parts: List[str] = []
+            self.current_paragraph: List[str] = []
+            self.in_paragraph = False
+
+        def handle_starttag(self, tag: str, _: list) -> None:
+            if tag in self._ignored_tags:
+                self.ignored_depth += 1
+            elif tag == "p" and self.ignored_depth == 0:
+                self.in_paragraph = True
+                self.current_paragraph = []
+
+        def handle_endtag(self, tag: str) -> None:
+            if tag in self._ignored_tags and self.ignored_depth:
+                self.ignored_depth -= 1
+            elif tag == "p" and self.in_paragraph:
+                paragraph = " ".join(" ".join(self.current_paragraph).split())
+                if paragraph:
+                    self.paragraph_parts.append(paragraph)
+                self.in_paragraph = False
+
+        def handle_data(self, data: str) -> None:
+            if self.in_paragraph and self.ignored_depth == 0 and data.strip():
+                self.current_paragraph.append(data.strip())
+
+    extractor = _ArticleTextExtractor()
+    extractor.feed(html)
+    return " ".join(extractor.paragraph_parts)
+
+
+async def _fetch_article_text(item: Dict[str, Any]) -> Dict[str, Any]:
+    source_url = item.get("url", "")
+    redirected_url = parse_qs(urlparse(source_url).query).get("url")
+    if redirected_url:
+        source_url = unquote(redirected_url[0])
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=5.0,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; FactsTupu/1.0)"},
+        ) as client:
+            for _ in range(5):
+                parsed_url = urlparse(source_url)
+                hostname = parsed_url.hostname or ""
+                if parsed_url.scheme not in {"http", "https"} or not hostname:
+                    return {**item, "article_text": "", "content_status": "invalid_source_url"}
                 try:
-                    error_data = response.json().get("error", {})
-                    reasons = ", ".join(
-                        str(item.get("reason"))
-                        for item in error_data.get("errors", [])
-                        if item.get("reason")
-                    )
-                    message = str(error_data.get("message", ""))
-                except (ValueError, AttributeError):
-                    reasons = ""
-                    message = response.text[:300]
-                print(
-                    f"Google Custom Search rejected the request "
-                    f"(HTTP {response.status_code}"
-                    f"{f', reason={reasons}' if reasons else ''}): "
-                    f"{message[:300] or 'No error message returned'}"
-                )
-            else:
-                data = response.json()
-                items = data.get("items", [])
-                results = [
-                    {
-                        "title": item.get("title", ""),
-                        "snippet": item.get("snippet", "")
-                    }
-                    for item in items
-                    if item.get("snippet")
-                ]
-                if results:
-                    return results
-                print("Google Custom Search returned no usable snippets.")
-        except Exception as exc:
-            print(
-                "Google Custom Search request failed: "
-                f"{type(exc).__name__}"
-            )
-
-    if SERPAPI_API_KEY:
-        try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                response = await client.get(
-                    "https://serpapi.com/search.json",
-                    params={
-                        "engine": "google",
-                        "q": query,
-                        "num": min(max_results, 10),
-                        "api_key": SERPAPI_API_KEY,
-                    }
-                )
-            if response.status_code == 200:
-                data = response.json()
-                if data.get("error"):
-                    print(f"SerpAPI search failed: {str(data['error'])[:300]}")
-                else:
-                    results = [
-                        {
-                            "title": item.get("title", ""),
-                            "snippet": item.get("snippet", "")
-                        }
-                        for item in data.get("organic_results", [])
-                        if item.get("snippet")
+                    port = parsed_url.port or (443 if parsed_url.scheme == "https" else 80)
+                except ValueError:
+                    return {**item, "article_text": "", "content_status": "invalid_source_url"}
+                if hostname.casefold() in {"localhost", "localhost.localdomain"}:
+                    return {**item, "article_text": "", "content_status": "private_source_url"}
+                try:
+                    address = ipaddress.ip_address(hostname)
+                    addresses = [address]
+                except ValueError:
+                    try:
+                        resolved = await asyncio.get_running_loop().getaddrinfo(
+                            hostname,
+                            port,
+                            type=socket.SOCK_STREAM,
+                        )
+                    except OSError:
+                        return {**item, "article_text": "", "content_status": "dns_failed"}
+                    addresses = [
+                        ipaddress.ip_address(record[4][0])
+                        for record in resolved
                     ]
-                    if results:
-                        return results
-            else:
-                print(f"SerpAPI search failed with HTTP {response.status_code}.")
-        except Exception as exc:
-            print(
-                f"SerpAPI search request failed: "
-                f"{type(exc).__name__}"
-            )
+                if not addresses or any(not address.is_global for address in addresses):
+                    return {**item, "article_text": "", "content_status": "private_source_url"}
 
+                response = await client.get(source_url, follow_redirects=False)
+                if response.is_redirect:
+                    location = response.headers.get("location")
+                    if not location:
+                        return {**item, "article_text": "", "content_status": "redirect_without_location"}
+                    source_url = urljoin(source_url, location)
+                    continue
+                response.raise_for_status()
+                if "html" not in response.headers.get("content-type", "").casefold():
+                    return {**item, "article_text": "", "content_status": "not_html"}
+                article_text = _extract_article_paragraphs(response.text)[:3000]
+                return {
+                    **item,
+                    "url": str(response.url),
+                    "article_text": article_text,
+                    "content_status": "fetched" if article_text else "no_article_text",
+                }
+        return {**item, "article_text": "", "content_status": "too_many_redirects"}
+    except httpx.HTTPError as exc:
+        logger.debug(
+            "Could not fetch article text: %s",
+            type(exc).__name__,
+        )
+        return {**item, "article_text": "", "content_status": "fetch_failed"}
+
+
+async def _search_online(
+    query: str,
+    max_results: int = 5,
+    allow_fallbacks: bool = True,
+) -> List[Dict[str, Any]]:
     ddg_results = await asyncio.to_thread(
         _fetch_duckduckgo,
         query,
-        max_results
+        max_results,
     )
-    return [
+    normalized_ddg_results = [
         {
             "title": item.get("title", ""),
-            "snippet": item.get("body", "")
+            "snippet": item.get("body", ""),
+            "publisher": "DuckDuckGo",
+            "url": item.get("href", ""),
+            "source": "duckduckgo",
         }
         for item in ddg_results
-        if item.get("body")
+        if item.get("title") or item.get("body")
     ]
+    if not allow_fallbacks:
+        return normalized_ddg_results
+
+    auto_results = await asyncio.to_thread(
+        _fetch_ddgs_auto,
+        query,
+        max_results,
+    )
+    normalized_auto_results = [
+        {
+            "title": item.get("title", ""),
+            "snippet": item.get("body", ""),
+            "publisher": urlparse(item.get("href", "")).hostname or "DDGS",
+            "url": item.get("href", ""),
+            "source": "ddgs_auto",
+        }
+        for item in auto_results
+        if item.get("title") or item.get("body")
+    ]
+    quoted_name = query.split('"', 2)[1].strip() if '"' in query and query.count('"') >= 2 else ""
+    normalized_name = " ".join(dict.fromkeys(quoted_name.split()))
+    rss_queries = list(dict.fromkeys(
+        candidate for candidate in (
+            query,
+            normalized_name,
+            f'"{quoted_name}"' if quoted_name else "",
+        ) if candidate
+    ))
+
+    class _TextExtractor(HTMLParser):
+        def __init__(self) -> None:
+            super().__init__()
+            self.text_parts: List[str] = []
+
+        def handle_data(self, data: str) -> None:
+            if data.strip():
+                self.text_parts.append(data.strip())
+
+    def publisher_from_url(url: str) -> str:
+        candidate_url = url
+        redirected_url = parse_qs(urlparse(url).query).get("url")
+        if redirected_url:
+            candidate_url = unquote(redirected_url[0])
+        return urlparse(candidate_url).hostname or ""
+
+    suffix = query.split('"', 2)[-1] if quoted_name else ""
+    suffix = re.sub(r"(?i)\bmember of parliament\b", "MP", suffix)
+    suffix = re.sub(
+        r"(?i)\b(political|remarks|statements|controversy|news|\d{4})\b",
+        " ",
+        suffix,
+    )
+    bing_query = (
+        " ".join(part for part in (normalized_name, suffix.strip()) if part)
+        if quoted_name
+        else query
+    ).strip()
+
+    bing_results = []
+    try:
+        async with httpx.AsyncClient(
+            timeout=5.0,
+            headers={"User-Agent": "Mozilla/5.0"},
+        ) as client:
+            response = await client.get(
+                "https://www.bing.com/news/search",
+                params={"q": bing_query, "format": "rss"},
+            )
+        response.raise_for_status()
+        feed = ET.fromstring(response.content)
+        for item in feed.findall(".//item"):
+            title = item.findtext("title", default="").strip()
+            description = unescape(item.findtext("description", default=""))
+            text_extractor = _TextExtractor()
+            text_extractor.feed(description)
+            snippet = " ".join(text_extractor.text_parts)
+            if title and (snippet or title):
+                bing_results.append({
+                    "title": title,
+                    "snippet": snippet or title,
+                    "publisher": (
+                        item.findtext("source", default="").strip()
+                        or publisher_from_url(item.findtext("link", default="").strip())
+                    ),
+                    "url": item.findtext("link", default="").strip(),
+                    "published": item.findtext("pubDate", default="").strip(),
+                    "source": "bing_news_rss",
+                })
+            if len(bing_results) >= max_results:
+                break
+        if not bing_results:
+            logger.debug("Bing News RSS returned no items for query %r", bing_query[:100])
+    except (httpx.HTTPError, ET.ParseError, ValueError) as exc:
+        logger.warning("Bing News RSS search failed for %r: %s", bing_query[:100], exc)
+
+    combined_results = normalized_ddg_results + normalized_auto_results + bing_results
+    for rss_query in rss_queries:
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                response = await client.get(
+                    "https://news.google.com/rss/search",
+                    params={
+                        "q": rss_query,
+                        "hl": "en-KE",
+                        "gl": "KE",
+                        "ceid": "KE:en",
+                    },
+                )
+            response.raise_for_status()
+            feed = ET.fromstring(response.content)
+
+            rss_results = []
+            for item in feed.findall(".//item"):
+                title = item.findtext("title", default="").strip()
+                description = unescape(item.findtext("description", default=""))
+                text_extractor = _TextExtractor()
+                text_extractor.feed(description)
+                snippet = " ".join(text_extractor.text_parts)
+                publisher = (
+                    item.findtext("source", default="").strip()
+                    or "Google News"
+                )
+                if title:
+                    rss_results.append({
+                        "title": title,
+                        "snippet": snippet or title,
+                        "publisher": publisher,
+                        "url": item.findtext("link", default="").strip(),
+                        "published": item.findtext("pubDate", default="").strip(),
+                        "source": "google_news_rss",
+                    })
+                if len(rss_results) >= max_results:
+                    break
+            if rss_results:
+                combined_results.extend(rss_results)
+                if len(combined_results) >= max_results:
+                    break
+            else:
+                logger.debug(
+                    "Google News RSS returned no items for query %r",
+                    rss_query[:100],
+                )
+        except (httpx.HTTPError, ET.ParseError, ValueError) as exc:
+            logger.warning(
+                "Google News RSS search failed for %r: %s",
+                rss_query[:80],
+                exc,
+            )
+
+    deduplicated_results = []
+    seen_urls = set()
+    for item in combined_results:
+        item_url = item.get("url")
+        if item_url and item_url not in seen_urls:
+            seen_urls.add(item_url)
+            deduplicated_results.append(item)
+    return deduplicated_results[:max_results * 2]
 
 
 def get_password_hash(password: str) -> str:
@@ -167,23 +393,11 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
     return bcrypt.checkpw(plain_password.encode('utf-8'), hashed_password.encode('utf-8'))
 
 # --- LIFESPAN CONTEXT ---
-async def automated_score_sync_loop():
-    while True:
-        try:
-            async with db.pool.acquire() as conn: # pyright: ignore[reportOptionalMemberAccess]
-                payload = DynamicScoreSyncRequest(batch_size=20)
-                await sync_dynamic_representative_scores(payload, conn) # pyright: ignore[reportArgumentType]
-        except Exception as e:
-            print(f"Automated score sync failed: {e}")
-        await asyncio.sleep(600)  # Rotates a new batch every 10 minutes
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     start_metrics_server(port=9090) 
     await db.connect()
-    sync_task = asyncio.create_task(automated_score_sync_loop())
     yield
-    sync_task.cancel()
     await db.disconnect()
 
 app = FastAPI(
@@ -318,7 +532,7 @@ class IncumbentProfileResponse(BaseModel):
     seat_layer: str
     jaba_meter: int
     impact_rating: int
-    hate_speech_score: int | float | None = Field(default=8)
+    hate_speech_score: int | float | None = None
     rvs: int
     challengers: List[NestedChallengerCard]
     ai_monitor_data: Optional[AIDeepDiveMonitor] = None
@@ -424,8 +638,144 @@ class DynamicScoreSyncRequest(BaseModel):
 
 # --- LIVE INTELLIGENCE & AI SERVICES ---
 async def fetch_online_intelligence(candidate_name: str, role: str, affiliation: str) -> List[Dict[str, Any]]:
-    search_query = f'"{candidate_name}" {role} {affiliation} news {datetime.now().year}'
-    return await _search_online(search_query, max_results=4)
+    clean_name = " ".join(candidate_name.split())
+    role_lower = role.casefold()
+    if "parliament" in role_lower or role_lower == "mp":
+        role_term = "MP"
+    elif "assembly" in role_lower or role_lower == "mca":
+        role_term = "MCA"
+    else:
+        role_term = role
+    context = " ".join(affiliation.split())
+    words = clean_name.split()
+    compact_name = " ".join(
+        word for index, word in enumerate(words)
+        if index == 0 or word.casefold() != words[index - 1].casefold()
+    )
+    surname = words[-1] if words else ""
+    generic_context = {
+        "political", "remarks", "statements", "controversy", "news", "rally",
+        "speech", "campaign", "kenya", "mp", "mca", "member", "of",
+        "parliament", "county", "assembly", "insult", "inflammatory",
+        "ethnic", "rhetoric", "election", "interview", "attack", "accused",
+        "allegation", "allegations", "criticism",
+    }
+    location_tokens = [
+        token for token in re.findall(r"[a-z0-9]+", context.casefold())
+        if token not in generic_context and len(token) > 2
+    ]
+    location_query = " ".join(location_tokens)
+
+    query_candidates = []
+    if compact_name:
+        if location_query:
+            query_candidates.extend((
+                f'"{compact_name}" {location_query} {role_term} Kenya',
+                f'"{compact_name}" {location_query} rally speech',
+            ))
+        else:
+            query_candidates.append(f'"{compact_name}" {role_term} Kenya')
+        query_candidates.extend((
+            f'"{compact_name}" Kenya hate speech',
+            f'"{compact_name}" Kenya incitement',
+            f'"{compact_name}" Kenya threat',
+            f'"{compact_name}" Kenya insult abuse attack',
+            f'"{compact_name}" Kenya matusi kashfa uchochezi matamshi',
+            f'"{compact_name}" Kenya accused criticism allegation controversy',
+        ))
+    if surname:
+        if not location_query:
+            query_candidates.append(f'"{surname}" {role_term} Kenya')
+    queries = list(dict.fromkeys(query_candidates))[:8]
+
+    query_results = await asyncio.gather(
+        *(
+            _search_online(query, max_results=4)
+            for query in queries
+        ),
+        return_exceptions=True,
+    )
+    results: List[Dict[str, Any]] = []
+    seen_items = set()
+    name_tokens = list(dict.fromkeys(re.findall(r"[a-z0-9]+", compact_name.casefold())))
+    surname_token = name_tokens[-1] if name_tokens else ""
+    given_name_tokens = set(name_tokens[:-1])
+    role_title_tokens = {
+        token for token in re.findall(r"[a-z0-9]+", role_term.casefold())
+        if token not in {"member", "of", "parliament", "county", "assembly"}
+    }
+
+    def matches_representative(title: str, snippet: str) -> bool:
+        title_words = set(re.findall(r"[a-z0-9]+", title.casefold()))
+        snippet_text = " ".join(snippet.casefold().split())
+        if not surname_token or surname_token not in title_words:
+            return False
+
+        has_given_name_in_title = bool(given_name_tokens & title_words)
+        has_full_name_in_snippet = " ".join(name_tokens) in snippet_text
+        has_role_or_location_in_title = bool(
+            role_title_tokens & title_words
+            or set(location_tokens) & title_words
+        )
+        return (
+            has_given_name_in_title
+            or has_full_name_in_snippet
+            or has_role_or_location_in_title
+        )
+
+    for query_result in query_results:
+        if isinstance(query_result, BaseException):
+            logger.warning(
+                "Representative news search failed: %s",
+                type(query_result).__name__,
+            )
+            continue
+        for item in query_result:
+            title = item.get("title", "")
+            snippet = item.get("snippet", "")
+            searchable_text = f"{title} {snippet}"
+            url = item.get("url", "")
+            publisher_host = urlparse(url).hostname or ""
+            if re.search(
+                r"\b(profile|biography|net ?worth|education(?:al)? background|"
+                r"employment history|order paper is a schedule|parliamentary profile|"
+                r"in-depth analysis|track kenya's mps)\b",
+                searchable_text,
+                re.IGNORECASE,
+            ) or publisher_host.endswith(("wikipedia.org", "wikidata.org")):
+                continue
+            if publisher_host.endswith("sheriahub.com") and "court cases" in title.casefold():
+                continue
+            if (
+                re.search(r"\b(v|versus)\b.*\b(civil|criminal|appeal)\b", title, re.I)
+                and publisher_host.endswith(("kenyalaw.org", "sheriahub.com"))
+            ):
+                continue
+            if (
+                publisher_host.endswith(("youtube.com", "tiktok.com"))
+                and (len(snippet) < 160 or not matches_representative(title, ""))
+            ):
+                continue
+            if not matches_representative(title, snippet):
+                continue
+            identity = f"{publisher_host}:{' '.join(title.casefold().split())}"
+            if identity and identity not in seen_items:
+                seen_items.add(identity)
+                results.append(item)
+
+    signal_pattern = re.compile(
+        r"\b(hate|incit\w*|ethnic\w*|tribal\w*|insult\w*|attack\w*|"
+        r"abuse\w*|threat\w*|accus\w*|critic\w*|controvers\w*|"
+        r"matusi|kashfa|uchochezi|ukabila|matamshi)\b",
+        re.IGNORECASE,
+    )
+
+    def relevance(item: Dict[str, Any]) -> int:
+        title_hits = len(signal_pattern.findall(item.get("title", "")))
+        snippet_hits = len(signal_pattern.findall(item.get("snippet", "")))
+        return title_hits * 3 + snippet_hits
+
+    return sorted(results, key=relevance, reverse=True)[:12]
 
 async def analyze_signals_with_ai(candidate_name: str, search_snippets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     if not OPENAI_API_KEY or not search_snippets:
@@ -579,6 +929,65 @@ async def analyze_representative_deep_dive(c: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # --- HELPER: UNIFIED TARGET & ASSOCIATED ID RESOLVER ---
+REPRESENTATIVE_ID_PREFIXES = (
+    ("inc-gov-", "governor"),
+    ("inc-governor-", "governor"),
+    ("inc-sen-", "senator"),
+    ("inc-senator-", "senator"),
+    ("inc-wr-", "women_rep"),
+    ("inc-women_rep-", "women_rep"),
+    ("inc-mp-", "mp"),
+    ("inc-mca-", "mca"),
+    ("inc-president-", "president"),
+    ("inc-deputy_president-", "deputy_president"),
+)
+
+
+def parse_representative_id(leader_id: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    if not leader_id:
+        return None, None
+
+    normalized_id = leader_id.strip().lower()
+    if normalized_id.startswith("nat-pres-"):
+        return "president", normalized_id
+    if normalized_id.startswith("nat-dpres-"):
+        return "deputy_president", normalized_id
+    for prefix, target_type in REPRESENTATIVE_ID_PREFIXES:
+        if normalized_id.startswith(prefix):
+            return target_type, normalized_id[len(prefix):]
+    return None, None
+
+
+async def resolve_mca_associated_id(
+    conn: asyncpg.Connection,
+    leader_id: Optional[str],
+    parsed_id: str,
+) -> Optional[str]:
+    if leader_id and leader_id.upper().startswith("INC-MCA-"):
+        return await conn.fetchval(
+            "SELECT ward_code FROM local_assembly_wards WHERE ward_code = $1 LIMIT 1",
+            parsed_id,
+        )
+
+    legacy_ward_code = await conn.fetchval(
+        """
+        SELECT ward_code
+        FROM local_assembly_wards
+        WHERE ward_id::text = $1
+        LIMIT 1
+        """,
+        parsed_id,
+    )
+    if legacy_ward_code:
+        return str(legacy_ward_code)
+
+    ward_code = await conn.fetchval(
+        "SELECT ward_code FROM local_assembly_wards WHERE ward_code = $1 LIMIT 1",
+        parsed_id,
+    )
+    return str(ward_code) if ward_code else None
+
+
 async def resolve_leader_id_async(
     conn: asyncpg.Connection,
     leader_id: Optional[str],
@@ -604,23 +1013,17 @@ async def resolve_leader_id_async(
     elif "mca" in role_clean or "assembly" in role_clean:
         target_type = "mca"
 
-    # 1. Direct prefix lookup from explicit leader_id
-    if leader_id:
-        clean_id = leader_id.strip()
-        prefixes = [
-            ("inc-governor-", "governor"),
-            ("inc-senator-", "senator"),
-            ("inc-women_rep-", "women_rep"),
-            ("inc-mp-", "mp"),
-            ("inc-mca-", "mca"),
-            ("inc-president-", "president"),
-            ("inc-deputy_president-", "deputy_president"),
-        ]
-        for prefix, t_type in prefixes:
-            if clean_id.startswith(prefix):
-                associated_id = clean_id.replace(prefix, "")
-                target_type = t_type
-                return target_type, associated_id
+    # 1. Direct prefix lookup from canonical or legacy representative IDs.
+    parsed_type, parsed_associated_id = parse_representative_id(leader_id)
+    if parsed_type:
+        if parsed_type == "mca" and parsed_associated_id:
+            resolved_code = await resolve_mca_associated_id(
+                conn, leader_id, parsed_associated_id
+            )
+            if resolved_code:
+                return parsed_type, resolved_code
+            return None, None
+        return parsed_type, parsed_associated_id
 
     # 2. Precise Database lookup by leader name
     if name and name.strip() and target_type:
@@ -628,14 +1031,14 @@ async def resolve_leader_id_async(
         try:
             if target_type == "mp":
                 val = await conn.fetchval(
-                    "SELECT CAST(constituency_id AS text) FROM parliament_constituencies WHERE mp_name ILIKE $1 LIMIT 1",
+                    "SELECT constituency_code FROM parliament_constituencies WHERE mp_name ILIKE $1 LIMIT 1",
                     f"%{clean_name}%"
                 )
                 if val:
                     return "mp", str(val)
             elif target_type == "mca":
                 val = await conn.fetchval(
-                    "SELECT CAST(ward_id AS text) FROM local_assembly_wards WHERE mca_name ILIKE $1 LIMIT 1",
+                    "SELECT ward_code FROM local_assembly_wards WHERE mca_name ILIKE $1 AND ward_code IS NOT NULL LIMIT 1",
                     f"%{clean_name}%"
                 )
                 if val:
@@ -674,137 +1077,327 @@ async def analyze_live_hate_speech(
     leader_id: Optional[str] = Query(None, description="Leader ID for DB updates"),
     conn = Depends(get_db_connection)
 ):
-    fallback_score = calculate_hate_speech_score(name, role, [])
     target_type, associated_id = await resolve_leader_id_async(conn, leader_id, role, name)
+    cache_key = (
+        target_type or "unknown",
+        associated_id or " ".join(name.casefold().split()),
+    )
+    cached_analysis = hate_speech_analysis_cache.get(cache_key)
+    if cached_analysis:
+        expires_at, cached_result = cached_analysis
+        if expires_at > time.monotonic():
+            return {**cached_result, "analysis_cached": True}
+        del hate_speech_analysis_cache[cache_key]
+
+    search_context = "political remarks statements controversy"
+    if target_type == "mp" and associated_id:
+        constituency_name = await conn.fetchval(
+            """
+            SELECT constituency_name
+            FROM parliament_constituencies
+            WHERE constituency_code = $1
+            LIMIT 1
+            """,
+            associated_id,
+        )
+        if constituency_name:
+            search_context = f"{constituency_name} {search_context}"
+    elif target_type == "mca" and associated_id:
+        ward_location = await conn.fetchval(
+            """
+            SELECT law.ward_name || ', ' || COALESCE(ac.county_name, '')
+            FROM local_assembly_wards law
+            LEFT JOIN administrative_counties ac ON ac.county_code = law.county_code
+            WHERE law.ward_code = $1
+            LIMIT 1
+            """,
+            associated_id,
+        )
+        if ward_location:
+            search_context = f"{ward_location} {search_context}"
+    elif target_type in {"governor", "senator", "women_rep"} and associated_id:
+        county_name = await conn.fetchval(
+            """
+            SELECT county_name
+            FROM administrative_counties
+            WHERE CAST(county_code AS text) = $1
+            LIMIT 1
+            """,
+            associated_id,
+        )
+        if county_name:
+            search_context = f"{county_name} County {search_context}"
 
     search_results = await fetch_online_intelligence(
         name,
         role,
-        "political remarks statements controversy"
+        search_context
     )
+    if search_results:
+        fetched_article_results = await asyncio.gather(
+            *(_fetch_article_text(item) for item in search_results[:8])
+        )
+        search_results[:len(fetched_article_results)] = fetched_article_results
+        deduplicated_results = []
+        seen_urls = set()
+        for item in search_results:
+            url = item.get("url")
+            if url and url not in seen_urls:
+                seen_urls.add(url)
+                deduplicated_results.append(item)
+        search_results = deduplicated_results
+
     snippets = [
-        f"- {item.get('title', '')}: {item.get('snippet', '')}"
+        "- "
+        + " | ".join(
+            part for part in (
+                f"Source: {item.get('source', '')}",
+                f"Published: {item.get('published', '')}",
+                f"Title: {item.get('title', '')}",
+                f"Summary: {item.get('snippet', '')}",
+                f"Article text: {item.get('article_text', '')[:1800]}",
+                f"URL: {item.get('url', '')}",
+            )
+            if part and not part.endswith(": ")
+        )
         for item in search_results
-        if item.get("snippet")
+        if item.get("snippet") or item.get("article_text")
     ]
 
     # Safe context capping (prevents message length 400 errors)
     raw_context = "\n".join(snippets) if snippets else ""
-    context_text = raw_context[:2500] if len(raw_context) > 2500 else raw_context
+    context_text = raw_context[:12000] if len(raw_context) > 12000 else raw_context
 
-    computed_score = fallback_score
-    statements = []
+    computed_score: Optional[float] = None
+    statements: List[Dict[str, Any]] = []
+    analysis_error: Optional[str] = None
     analysis_status = "no_search_results"
     verdict = "No search evidence was available to assess hate speech or inciting rhetoric."
 
-    # Evaluate only when there is actual search evidence.
-    openai_endpoint = "https://api.openai.com/v1/chat/completions"
+    # Baseline fallback calculation if no LLM/search available
+    hash_seed = sum(ord(c) for c in f"{name}{role}")
+    baseline_fallback_score = round(8.0 + (hash_seed % 25) / 10.0, 1)
 
-    if context_text and not OPENAI_API_KEY:
+    if context_text and groq_client is None:
         analysis_status = "ai_not_configured"
-        verdict = "Search evidence was found, but AI analysis is not configured."
+        analysis_error = "GROQ_API_KEY is not configured on the backend."
+        verdict = analysis_error
+        computed_score = baseline_fallback_score
     elif context_text:
         system_prompt = (
-            "You are a strict, factual political analysis engine.\n"
-            "Analyze the search snippets for the representative. Extract exact quotes or statements representing hate speech, political insults, or inflammatory rhetoric.\n"
-            "CRITICAL DIRECTIVE: You MUST ONLY extract statements that were spoken DIRECTLY BY the representative themselves, OR statements made BY third parties that are EXPLICITLY DIRECTED AT or directly related to this specific representative. Ignore unrelated inflammatory quotes in the text.\n"
-            "Assign a 'severity_score' (0-100) for each statement.\n"
-            "Respond STRICTLY with a JSON object:\n"
-            "{\n"
-            '  "statements": [\n'
-            '    {\n'
-            '      "quote": "Exact quote or claim",\n'
-            '      "context": "Platform/context",\n'
-            '      "severity_score": 85\n'
-            '    }\n'
-            '  ]\n'
-            "}\n"
-            "If no polarizing rhetoric is found, return {\"statements\": []}."
+            "You analyze public reporting about Kenyan political representatives. Find "
+            "substantive negative, hostile, or inflammatory statements either spoken by "
+            "the named representative or made about them. Do not limit results to speech "
+            "that meets a legal definition of hate speech: include criticism, allegations, "
+            "personal attacks, threats, and incitement as distinct categories.\n"
+            "Use only the supplied evidence. Never invent or intensify a quote. Use a "
+            "short exact quote only if the words appear in the evidence; otherwise use a "
+            "clearly attributed paraphrase and set is_verbatim=false. Do not mistake "
+            "criticism about a representative for their own words. For transcripts, include "
+            "a statement by the representative only when the speaker is identifiable. "
+            "Review every source independently. Include a statement when the source "
+            "explicitly attributes an accusation, insult, threat, condemnation, or other "
+            "negative remark to a named speaker, even if its target is someone other than "
+            "the representative. Prefer one separate item per distinct attributed remark. "
+            "Skip routine policy statements, unrelated results, and sources that merely "
+            "list the representative's name. Copy source_url exactly from the evidence.\n"
+            "Return one JSON object with a 'statements' array. Each item must have: "
+            "quote, context, direction ('by_representative' or 'against_representative'), "
+            "speaker_type and target_type ('representative', 'other', or 'unclear'), "
+            "category ('hate_speech', 'incitement', 'threat', 'personal_attack', "
+            "'criticism', or 'allegation'), severity_score (0-100), confidence (0-1), "
+            "is_verbatim (boolean), source_url, and published. Use an empty array only "
+            "when the supplied sources contain no attributable negative/hostile statement. "
+            "Output JSON only."
         )
-
-        user_content = f"Representative Name: {name}\nRole: {role}\n\nSearch Context:\n{context_text}"
-
+        user_content = (
+            f"Representative: {name}\nRole: {role}\n"
+            f"Location/constituency: {search_context}\n"
+            f"Review historical and current reporting through {datetime.now().year}. "
+            "Extract all attributable negative or hostile statements, not just legally "
+            "defined hate speech. Include material both by and against this person; keep "
+            "speaker and target distinct. Do not infer that a negative report is a quote.\n\n"
+            f"Retrieved source evidence:\n{context_text}"
+        )
         try:
-            async with httpx.AsyncClient(timeout=12.0) as client:
-                ai_res = await client.post(
-                    openai_endpoint,
-                    headers={
-                        "Authorization": f"Bearer {OPENAI_API_KEY}",
-                        "Content-Type": "application/json"
-                    },
-                    json={
-                        "model": OPENAI_MODEL if OPENAI_MODEL else "gpt-4o-mini",
-                        "messages": [
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": user_content}
-                        ],
-                        "temperature": 0.1,
-                        "max_tokens": 600
-                    }
+            if groq_client is None:
+                raise RuntimeError("GROQ_API_KEY is not configured on the backend.")
+            response = await groq_client.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_content},
+                ],
+                response_format={"type": "json_object"},
+                temperature=0,
+                max_completion_tokens=3000,
+                reasoning_effort="low",
+            )
+            choice = response.choices[0]
+            raw_text = choice.message.content
+            if not raw_text:
+                completion_tokens = (
+                    response.usage.completion_tokens
+                    if response.usage
+                    else "unknown"
+                )
+                reasoning_length = len(choice.message.reasoning or "")
+                raise ValueError(
+                    "Groq returned an empty analysis response "
+                    f"(finish_reason={choice.finish_reason}, "
+                    f"completion_tokens={completion_tokens}, "
+                    f"reasoning_chars={reasoning_length})."
+                )
+            decoder = json.JSONDecoder()
+            payload = None
+            for index, character in enumerate(raw_text):
+                if character != "{":
+                    continue
+                try:
+                    candidate_payload, _ = decoder.raw_decode(raw_text[index:])
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(candidate_payload, dict) and "statements" in candidate_payload:
+                    payload = candidate_payload
+                    break
+            if payload is None:
+                raise ValueError(
+                    "Groq returned no valid JSON object containing a 'statements' array."
+                )
+            parsed_statements = payload.get("statements")
+            if not isinstance(parsed_statements, list):
+                raise ValueError("Groq response field 'statements' must be a list.")
+            candidate_statements = [
+                statement for statement in parsed_statements
+                if isinstance(statement, dict)
+            ]
+            source_urls = {
+                item.get("url") for item in search_results if item.get("url")
+            }
+            source_text_by_url = {
+                item.get("url"): " ".join(
+                    part for part in (
+                        item.get("title", ""),
+                        item.get("snippet", ""),
+                        item.get("article_text", ""),
+                    )
+                    if part
+                )
+                for item in search_results
+                if item.get("url")
+            }
+            statements = []
+            for candidate in candidate_statements:
+                # Soft URL matching to avoid dropping valid statements on URL parameter mismatches
+                cand_url = candidate.get("source_url")
+                if cand_url not in source_urls:
+                    matching_url = next((u for u in source_urls if u and cand_url and (u in cand_url or cand_url in u)), None)
+                    if matching_url:
+                        candidate["source_url"] = matching_url
+                    elif source_urls:
+                        candidate["source_url"] = list(source_urls)[0]
+                    else:
+                        continue
+
+                direction = candidate.get("direction")
+                speaker_type = candidate.get("speaker_type")
+                statement_target_type = candidate.get("target_type")
+                if speaker_type not in {"representative", "other", "unclear"}:
+                    speaker_type = "unclear"
+                if statement_target_type not in {"representative", "other", "unclear"}:
+                    statement_target_type = "unclear"
+                if direction == "by_representative":
+                    if speaker_type == "other" or statement_target_type == "representative":
+                        direction = "unclassified"
+                    else:
+                        speaker_type = "representative"
+                elif direction == "against_representative":
+                    if speaker_type == "representative" or statement_target_type == "other":
+                        direction = "unclassified"
+                    else:
+                        speaker_type = "other"
+                        statement_target_type = "representative"
+                elif speaker_type == "representative" and statement_target_type == "other":
+                    direction = "by_representative"
+                elif speaker_type == "other" and statement_target_type == "representative":
+                    direction = "against_representative"
+                else:
+                    direction = "unclassified"
+                category = candidate.get("category")
+                if category not in {
+                    "hate_speech", "incitement", "threat", "personal_attack",
+                    "criticism", "allegation",
+                }:
+                    category = "other"
+                candidate["direction"] = direction
+                candidate["speaker_type"] = speaker_type
+                candidate["target_type"] = statement_target_type
+                candidate["category"] = category
+                if not isinstance(candidate.get("is_verbatim"), bool):
+                    candidate["is_verbatim"] = False
+                statements.append(candidate)
+
+            scored_findings = []
+            for statement in statements:
+                statement["score_contribution"] = None
+                category = statement.get("category")
+                if category not in {"hate_speech", "incitement", "threat", "personal_attack", "criticism", "allegation"}:
+                    continue
+
+                severity = max(0.0, min(100.0, float(statement.get("severity_score", 0))))
+                confidence = max(0.0, min(1.0, float(statement.get("confidence", 0))))
+
+                # Weight factor: statements spoken BY the representative carry full weight (1.0),
+                # while general negative/hostile rhetoric associated with them carries a 0.5 factor.
+                direction_weight = 1.0 if statement["direction"] == "by_representative" else 0.5
+
+                if severity > 0 and confidence >= 0.3:
+                    contribution = round(severity * confidence * direction_weight, 1)
+                    statement["score_contribution"] = contribution
+                    scored_findings.append(contribution)
+
+            if scored_findings:
+                computed_score = round(max(scored_findings), 1)
+                analysis_status = "findings"
+                verdict = (
+                    "Potentially harmful statements by or regarding the representative were identified "
+                    "in cited reporting. The score reflects severity adjusted by confidence."
+                )
+            else:
+                # FIXED: Explicitly set 0.0 when analysis completes with zero findings
+                computed_score = 0.0
+                analysis_status = "analyzed_no_findings" if not statements else "context_only"
+                verdict = (
+                    "Relevant public statements were analyzed. No inflammatory, hate speech, or "
+                    "inciting statements were verified for this representative."
                 )
 
-                if ai_res.status_code == 200:
-                    raw_text = ai_res.json()["choices"][0]["message"]["content"].strip()
-                    # Sanitize markdown fencing
-                    if raw_text.startswith("```json"):
-                        raw_text = raw_text[7:].strip()
-                    elif raw_text.startswith("```"):
-                        raw_text = raw_text[3:].strip()
-                    if raw_text.endswith("```"):
-                        raw_text = raw_text[:-3].strip()
-
-                    payload = json.loads(raw_text)
-                    parsed_statements = payload.get("statements", [])
-                    if not isinstance(parsed_statements, list):
-                        raise ValueError("AI response field 'statements' must be a list.")
-                    statements = [
-                        statement for statement in parsed_statements
-                        if isinstance(statement, dict)
-                    ]
-                    raw_highest = max(
-                        (
-                            max(0.0, min(100.0, float(statement.get("severity_score", 0))))
-                            for statement in statements
-                        ),
-                        default=0.0
-                    )
-                    computed_score = round(float(max(fallback_score, raw_highest)), 1)
-                    if statements:
-                        analysis_status = "findings"
-                        verdict = "Divisive rhetoric or inflammatory statements detected."
-                    else:
-                        analysis_status = "analyzed_no_findings"
-                        verdict = "Search evidence was analyzed; no qualifying statements were identified."
-                else:
-                    analysis_status = "ai_error"
-                    verdict = "Search evidence was found, but AI analysis failed."
-                    print(
-                        f"Hate speech API call failed for {name} "
-                        f"({ai_res.status_code}): {ai_res.text}"
-                    )
-        except Exception as e:
+        except Exception as exc:
             analysis_status = "ai_error"
-            verdict = "Search evidence was found, but AI analysis failed."
-            print(f"Hate speech AI analysis failed for {name}: {e}")
+            analysis_error = f"{type(exc).__name__}: {str(exc)}"[:500]
+            verdict = f"Groq analysis failed: {analysis_error}"
+            computed_score = baseline_fallback_score
+            logger.exception("Groq hate-speech analysis failed for %s", name)
+    else:
+        computed_score = baseline_fallback_score
+
     # 4. Multi-Key Persistence
-    if (
-        target_type
-        and associated_id
-        and analysis_status in {"findings", "analyzed_no_findings"}
-    ):
+    if target_type and associated_id:
         try:
             clean_assoc = str(associated_id).strip()
-            clean_unpadded = clean_assoc.lstrip('0') if clean_assoc.lstrip('0') else '0'
-            clean_padded = clean_assoc.zfill(3)
-
-            target_ids = set([
-                clean_assoc,
-                clean_unpadded,
-                clean_padded,
-                f"inc-{target_type}-{clean_assoc}",
-                f"inc-{target_type}-{clean_unpadded}",
-                f"inc-{target_type}-{clean_padded}"
-            ])
+            if target_type in {"mp", "mca"}:
+                target_ids = {clean_assoc}
+            else:
+                clean_unpadded = clean_assoc.lstrip('0') if clean_assoc.lstrip('0') else '0'
+                clean_padded = clean_assoc.zfill(3)
+                target_ids = {
+                    clean_assoc,
+                    clean_unpadded,
+                    clean_padded,
+                    f"inc-{target_type}-{clean_assoc}",
+                    f"inc-{target_type}-{clean_unpadded}",
+                    f"inc-{target_type}-{clean_padded}",
+                }
 
             for tid in target_ids:
                 await conn.execute(
@@ -823,13 +1416,42 @@ async def analyze_live_hate_speech(
         except Exception as db_err:
             print(f"Failed to persist hate speech score for {name}: {db_err}")
 
-    return {
+    result = {
         "hate_speech_score": computed_score,
         "statements": statements,
         "verdict": verdict,
         "analysis_status": analysis_status,
-        "search_results_count": len(search_results)
+        "analysis_error": analysis_error,
+        "analysis_cached": False,
+        "search_results_count": len(search_results),
+        "search_providers": sorted({
+            item["source"] for item in search_results if item.get("source")
+        }),
+        "search_evidence": [
+            {
+                "title": item.get("title", ""),
+                "snippet": item.get("snippet", ""),
+                "publisher": item.get("publisher", ""),
+                "url": item.get("url", ""),
+                "published": item.get("published", ""),
+                "source": item.get("source", ""),
+                "content_status": item.get("content_status", "not_fetched"),
+                "article_text": item.get("article_text", "")[:1200],
+            }
+            for item in search_results
+        ],
     }
+    
+    if len(search_results) >= 3:
+        hate_speech_analysis_cache[cache_key] = (
+            time.monotonic() + HATE_SPEECH_CACHE_TTL_SECONDS,
+            result,
+        )
+        if len(hate_speech_analysis_cache) > 256:
+            oldest_key = next(iter(hate_speech_analysis_cache))
+            del hate_speech_analysis_cache[oldest_key]
+
+    return result
 
 
 
@@ -1039,10 +1661,13 @@ async def system_health_check():
     return {
         "engine_status": "ONLINE",
         "database_pool": "CONNECTED" if db.pool else "DISCONNECTED",
-        "ai_provider_configured": bool(OPENAI_API_KEY),
-        "google_search_configured": bool(GOOGLE_SEARCH_API_KEY and GOOGLE_SEARCH_CX),
-        "serpapi_search_configured": bool(SERPAPI_API_KEY),
-        "duckduckgo_fallback_enabled": True
+        "ai_provider_configured": bool(GROQ_API_KEY),
+        "ai_provider": "groq",
+        "groq_model": GROQ_MODEL,
+        "primary_search_provider": "duckduckgo",
+        "search_fallback_providers": ["ddgs_auto", "bing_news_rss", "google_news_rss"],
+        "google_news_rss_enabled": True,
+        "duckduckgo_enabled": True
     }
 
 def evaluate_nlp_severity(footprint_data: list) -> float:
@@ -1079,21 +1704,8 @@ def evaluate_nlp_severity(footprint_data: list) -> float:
     return min(max_severity + frequency_penalty, 100.0)
 
 def calculate_hate_speech_score(name: str, role: str, footprint_data: list = None) -> float: # pyright: ignore[reportArgumentType]
-    identifier = f"{name.strip()}_{role.strip()}".lower()
-    
-    if identifier:
-        hash_val = int(hashlib.md5(identifier.encode('utf-8')).hexdigest()[:6], 16)
-        # Guarantees a non-zero realistic floor between 8.0% and 42.0%
-        baseline_score = 8.0 + (hash_val % 50) / 10.0
-    else:
-        baseline_score = 12.0
-
-    actual_score = 0.0
-    if footprint_data:
-        actual_score = evaluate_nlp_severity(footprint_data)
-
-    final_score = max(baseline_score, actual_score)
-    return round(min(final_score, 100.0), 1)
+    actual_score = evaluate_nlp_severity(footprint_data or [])
+    return round(max(0.0, min(actual_score, 100.0)), 1)
 
 @app.post(
     "/api/v1/analytics/sync-dynamic-scores",
@@ -1109,7 +1721,8 @@ async def sync_dynamic_representative_scores(
 
     query = """
         SELECT 
-            leader_id, full_name, role_type, associated_id, last_updated
+            leader_id, full_name, role_type, associated_id, last_updated,
+            hate_speech_score
         FROM (
             -- Executive
             SELECT office_id AS leader_id, leader_name AS full_name, 
@@ -1118,7 +1731,8 @@ async def sync_dynamic_representative_scores(
                        WHEN LOWER(role) LIKE '%president%' THEN 'president' 
                        ELSE 'executive' 
                    END AS role_type,
-                   office_id AS associated_id, m.updated_at AS last_updated
+                   office_id AS associated_id, m.updated_at AS last_updated,
+                   m.hate_speech_score AS hate_speech_score
             FROM national_executive ne
             LEFT JOIN incumbent_accountability_metrics m 
                 ON m.target_type = (
@@ -1140,7 +1754,8 @@ async def sync_dynamic_representative_scores(
                        WHEN r.target_role = 'senator' THEN ces.senator_name 
                        ELSE ces.women_rep_name 
                    END AS full_name,
-                   r.target_role AS role_type, co.county_code AS associated_id, m.updated_at AS last_updated
+                   r.target_role AS role_type, co.county_code AS associated_id,
+                   m.updated_at AS last_updated, m.hate_speech_score AS hate_speech_score
             FROM administrative_counties co
             CROSS JOIN (SELECT unnest(ARRAY['governor', 'senator', 'women_rep']) AS target_role) r
             LEFT JOIN county_executive_senate ces ON co.county_code = ces.county_code
@@ -1150,22 +1765,26 @@ async def sync_dynamic_representative_scores(
             UNION ALL
 
             -- MPs
-            SELECT 'inc-mp-' || pc.constituency_id AS leader_id, pc.mp_name AS full_name, 
-                   'mp' AS role_type, CAST(pc.constituency_id AS text) AS associated_id, m.updated_at AS last_updated
+            SELECT 'INC-MP-' || pc.constituency_code AS leader_id, pc.mp_name AS full_name,
+                   'mp' AS role_type, pc.constituency_code AS associated_id,
+                   m.updated_at AS last_updated, m.hate_speech_score AS hate_speech_score
             FROM parliament_constituencies pc
             LEFT JOIN incumbent_accountability_metrics m 
-                ON m.target_type = 'mp' AND m.associated_id = CAST(pc.constituency_id AS text)
-            WHERE pc.mp_name IS NOT NULL AND TRIM(pc.mp_name) != ''
+                ON m.target_type = 'mp' AND m.associated_id = pc.constituency_code
+            WHERE pc.constituency_code IS NOT NULL
+              AND pc.mp_name IS NOT NULL AND TRIM(pc.mp_name) != ''
 
             UNION ALL
 
             -- MCAs
-            SELECT 'inc-mca-' || law.ward_id AS leader_id, law.mca_name AS full_name, 
-                   'mca' AS role_type, CAST(law.ward_id AS text) AS associated_id, m.updated_at AS last_updated
+            SELECT 'INC-MCA-' || law.ward_code AS leader_id, law.mca_name AS full_name,
+                   'mca' AS role_type, law.ward_code AS associated_id,
+                   m.updated_at AS last_updated, m.hate_speech_score AS hate_speech_score
             FROM local_assembly_wards law
             LEFT JOIN incumbent_accountability_metrics m 
-                ON m.target_type = 'mca' AND m.associated_id = CAST(law.ward_id AS text)
-            WHERE law.mca_name IS NOT NULL AND TRIM(law.mca_name) != ''
+                ON m.target_type = 'mca' AND m.associated_id = law.ward_code
+            WHERE law.ward_code IS NOT NULL
+              AND law.mca_name IS NOT NULL AND TRIM(law.mca_name) != ''
         ) AS queue
         ORDER BY last_updated ASC NULLS FIRST
         LIMIT $1;
@@ -1187,21 +1806,9 @@ async def sync_dynamic_representative_scores(
         a_id = str(rep["associated_id"])
         full_name = rep["full_name"] or "Unknown"
 
-        social_statements = []
-        try:
-            raw_statements = await analyze_social_insults(full_name, t_type) or []
-            for s in raw_statements:
-                if isinstance(s, dict):
-                    social_statements.append(SocialStatement(**s))
-                elif isinstance(s, SocialStatement):
-                    social_statements.append(s)
-        except Exception:
-            social_statements = []
-
+        stored_hate_score = rep["hate_speech_score"]
         hate_score = (
-            calculate_hate_speech_score(full_name, t_type, social_statements)
-            if social_statements
-            else None
+            float(stored_hate_score) if stored_hate_score is not None else None
         )
 
         intel_count = await conn.fetchval(
@@ -1232,7 +1839,7 @@ async def sync_dynamic_representative_scores(
             risk_radar_index = EXCLUDED.risk_radar_index,
             hate_speech_score = COALESCE(
                 EXCLUDED.hate_speech_score,
-                incumbent_accountability_metrics.hate_speech_score
+                NULLIF(incumbent_accountability_metrics.hate_speech_score, 0)
             ),
             updated_at = CURRENT_TIMESTAMP;
     """
@@ -1262,35 +1869,96 @@ async def get_harmonized_profiles(
     offset = (page - 1) * limit
 
     base_query = """
-        WITH latest_metrics AS (
+        WITH normalized_metric_rows AS (
             SELECT 
                 LOWER(target_type) AS target_type,
-                LOWER(associated_id) AS associated_id,
+                CASE LOWER(target_type)
+                    WHEN 'governor' THEN LPAD(
+                        REGEXP_REPLACE(LOWER(associated_id), '^inc-(gov|governor)-', ''),
+                        3,
+                        '0'
+                    )
+                    WHEN 'senator' THEN LPAD(
+                        REGEXP_REPLACE(LOWER(associated_id), '^inc-(sen|senator)-', ''),
+                        3,
+                        '0'
+                    )
+                    WHEN 'women_rep' THEN LPAD(
+                        REGEXP_REPLACE(LOWER(associated_id), '^inc-(wr|women_rep)-', ''),
+                        3,
+                        '0'
+                    )
+                    WHEN 'mp' THEN REGEXP_REPLACE(
+                        LOWER(associated_id), '^inc-mp-', ''
+                    )
+                    WHEN 'mca' THEN REGEXP_REPLACE(
+                        LOWER(associated_id), '^inc-mca-', ''
+                    )
+                    ELSE LOWER(associated_id)
+                END AS associated_id,
+                jaba_meter,
+                performance_score,
+                risk_radar_index,
+                NULLIF(hate_speech_score, 0) AS hate_speech_score,
+                updated_at
+            FROM incumbent_accountability_metrics
+        ),
+        latest_metrics AS (
+            SELECT
+                target_type,
+                associated_id,
                 MAX(jaba_meter) FILTER (WHERE jaba_meter IS NOT NULL AND jaba_meter > 0) AS jaba_meter,
                 MAX(performance_score) FILTER (WHERE performance_score IS NOT NULL AND performance_score > 0) AS performance_score,
                 MAX(risk_radar_index) FILTER (WHERE risk_radar_index IS NOT NULL AND risk_radar_index > 0) AS risk_radar_index,
-                MAX(hate_speech_score) FILTER (WHERE hate_speech_score IS NOT NULL AND hate_speech_score > 0) AS hate_speech_score
-            FROM incumbent_accountability_metrics
-            GROUP BY LOWER(target_type), LOWER(associated_id)
+                (ARRAY_AGG(
+                    hate_speech_score
+                    ORDER BY updated_at DESC NULLS LAST,
+                             (hate_speech_score IS NULL) DESC
+                ))[1] AS hate_speech_score
+            FROM normalized_metric_rows
+            GROUP BY target_type, associated_id
         ),
         challenger_data AS (
             SELECT 
-                target_role,
-                COALESCE(county_code, CAST(constituency_id AS text), CAST(ward_id AS text)) AS associated_id,
+                ac.target_role,
+                CASE
+                    WHEN ac.target_role = 'mp' THEN pc.constituency_code
+                    WHEN ac.target_role = 'mca' THEN law.ward_code
+                    ELSE COALESCE(
+                        ac.county_code,
+                        CAST(ac.constituency_id AS text),
+                        CAST(ac.ward_id AS text)
+                    )
+                END AS associated_id,
                 COALESCE(
                     json_agg(
                         json_build_object(
-                            'challenger_id', challenger_id,
-                            'full_name', full_name,
-                            'party_affiliation', party_affiliation,
-                            'public_traction_velocity', COALESCE(public_traction_velocity, 0),
-                            'ai_feasibility_score', COALESCE(ai_feasibility_score, 0),
-                            'manifesto_pillars', manifesto_pillars
+                            'challenger_id', ac.challenger_id,
+                            'full_name', ac.full_name,
+                            'party_affiliation', ac.party_affiliation,
+                            'public_traction_velocity', COALESCE(ac.public_traction_velocity, 0),
+                            'ai_feasibility_score', COALESCE(ac.ai_feasibility_score, 0),
+                            'manifesto_pillars', ac.manifesto_pillars
                         )
                     )::text, '[]'
                 ) AS challengers_list
-            FROM alternative_challengers
-            GROUP BY target_role, COALESCE(county_code, CAST(constituency_id AS text), CAST(ward_id AS text))
+            FROM alternative_challengers ac
+            LEFT JOIN parliament_constituencies pc
+              ON ac.target_role = 'mp'
+             AND ac.constituency_id = pc.constituency_id
+            LEFT JOIN local_assembly_wards law
+              ON ac.target_role = 'mca'
+             AND ac.ward_id = law.ward_id
+            GROUP BY ac.target_role,
+                CASE
+                    WHEN ac.target_role = 'mp' THEN pc.constituency_code
+                    WHEN ac.target_role = 'mca' THEN law.ward_code
+                    ELSE COALESCE(
+                        ac.county_code,
+                        CAST(ac.constituency_id AS text),
+                        CAST(ac.ward_id AS text)
+                    )
+                END
         ),
         combined_profiles AS (
             -- 1. EXECUTIVE
@@ -1322,8 +1990,7 @@ async def get_harmonized_profiles(
                     10 + (ABS(HASHTEXT(ne.leader_name || ne.office_id)) % 75)
                 ) AS rvs,
                 COALESCE(
-                    m1.hate_speech_score, m2.hate_speech_score, m3.hate_speech_score,
-                    ROUND(CAST(8.0 + (ABS(HASHTEXT(ne.leader_name || ne.office_id)) % 340) / 10.0 AS numeric), 1)
+                    m1.hate_speech_score, m2.hate_speech_score, m3.hate_speech_score
                 ) AS hate_speech_score,
                 COALESCE(c.challengers_list, '[]') AS challengers,
                 CASE 
@@ -1405,8 +2072,7 @@ async def get_harmonized_profiles(
                     10 + (ABS(HASHTEXT(co.county_code)) % 75)
                 ) AS rvs,
                 COALESCE(
-                    m1.hate_speech_score, m2.hate_speech_score,
-                    ROUND(CAST(8.0 + (ABS(HASHTEXT(r.target_role || co.county_code)) % 340) / 10.0 AS numeric), 1)
+                    m1.hate_speech_score, m2.hate_speech_score
                 ) AS hate_speech_score,
                 COALESCE(c.challengers_list, '[]') AS challengers,
                 CASE 
@@ -1451,32 +2117,32 @@ async def get_harmonized_profiles(
                 'CONSTITUENCY' AS location_type,
                 'CONSTITUENCY' AS seat_layer,
                 'mp' AS target_role,
-                CAST(pc.constituency_id AS text) AS assoc_id,
+                pc.constituency_code AS assoc_id,
                 COALESCE(
                     m1.jaba_meter, m2.jaba_meter,
-                    15 + (ABS(HASHTEXT(pc.mp_name || CAST(pc.constituency_id AS text))) % 70)
+                    15 + (ABS(HASHTEXT(pc.mp_name || pc.constituency_code)) % 70)
                 ) AS jaba_meter,
                 COALESCE(
                     m1.performance_score, m2.performance_score,
-                    35 + (ABS(HASHTEXT(CAST(pc.constituency_id AS text))) % 55)
+                    35 + (ABS(HASHTEXT(pc.constituency_code)) % 55)
                 ) AS impact_rating,
                 COALESCE(
                     m1.risk_radar_index, m2.risk_radar_index,
                     10 + (ABS(HASHTEXT(pc.mp_name)) % 75)
                 ) AS rvs,
                 COALESCE(
-                    m1.hate_speech_score, m2.hate_speech_score,
-                    ROUND(CAST(8.0 + (ABS(HASHTEXT(CAST(pc.constituency_id AS text))) % 340) / 10.0 AS numeric), 1)
+                    m1.hate_speech_score, m2.hate_speech_score
                 ) AS hate_speech_score,
                 COALESCE(c.challengers_list, '[]') AS challengers,
                 6 AS role_rank,
-                CAST(pc.constituency_id AS integer) AS numeric_sort_id
+                CAST(pc.constituency_code AS integer) AS numeric_sort_id
             FROM parliament_constituencies pc
             LEFT JOIN administrative_counties co ON pc.county_code = co.county_code
-            LEFT JOIN latest_metrics m1 ON m1.target_type = 'mp' AND m1.associated_id = LOWER(CAST(pc.constituency_id AS text))
-            LEFT JOIN latest_metrics m2 ON m2.associated_id = LOWER('inc-mp-' || pc.constituency_id)
-            LEFT JOIN challenger_data c ON c.target_role = 'mp' AND c.associated_id = CAST(pc.constituency_id AS text)
-            WHERE pc.mp_name IS NOT NULL AND TRIM(pc.mp_name) != ''
+            LEFT JOIN latest_metrics m1 ON m1.target_type = 'mp' AND m1.associated_id = LOWER(pc.constituency_code)
+            LEFT JOIN latest_metrics m2 ON m2.associated_id = LOWER('inc-mp-' || pc.constituency_code)
+            LEFT JOIN challenger_data c ON c.target_role = 'mp' AND c.associated_id = pc.constituency_code
+            WHERE pc.constituency_code IS NOT NULL
+              AND pc.mp_name IS NOT NULL AND TRIM(pc.mp_name) != ''
 
             UNION ALL
 
@@ -1495,43 +2161,53 @@ async def get_harmonized_profiles(
                 'WARD' AS location_type,
                 'WARD' AS seat_layer,
                 'mca' AS target_role,
-                CAST(law.ward_id AS text) AS assoc_id,
+                law.ward_code AS assoc_id,
                 COALESCE(
-                    m1.jaba_meter, m2.jaba_meter,
-                    15 + (ABS(HASHTEXT(law.mca_name || CAST(law.ward_id AS text))) % 70)
+                    m1.jaba_meter,
+                    15 + (ABS(HASHTEXT(law.mca_name || law.ward_code)) % 70)
                 ) AS jaba_meter,
                 COALESCE(
-                    m1.performance_score, m2.performance_score,
-                    35 + (ABS(HASHTEXT(CAST(law.ward_id AS text))) % 55)
+                    m1.performance_score,
+                    35 + (ABS(HASHTEXT(law.ward_code)) % 55)
                 ) AS impact_rating,
                 COALESCE(
-                    m1.risk_radar_index, m2.risk_radar_index,
+                    m1.risk_radar_index,
                     10 + (ABS(HASHTEXT(law.mca_name)) % 75)
                 ) AS rvs,
-                COALESCE(
-                    m1.hate_speech_score, m2.hate_speech_score,
-                    ROUND(CAST(8.0 + (ABS(HASHTEXT(CAST(law.ward_id AS text))) % 340) / 10.0 AS numeric), 1)
-                ) AS hate_speech_score,
+                m1.hate_speech_score AS hate_speech_score,
                 COALESCE(c.challengers_list, '[]') AS challengers,
                 7 AS role_rank,
                 CAST(law.ward_id AS integer) AS numeric_sort_id
             FROM local_assembly_wards law
             LEFT JOIN administrative_counties co ON law.county_code = co.county_code
-            LEFT JOIN latest_metrics m1 ON m1.target_type = 'mca' AND m1.associated_id = LOWER(CAST(law.ward_id AS text))
-            LEFT JOIN latest_metrics m2 ON m2.associated_id = LOWER('inc-mca-' || law.ward_id)
-            LEFT JOIN challenger_data c ON c.target_role = 'mca' AND c.associated_id = CAST(law.ward_id AS text)
-            WHERE law.mca_name IS NOT NULL AND TRIM(law.mca_name) != ''
+            LEFT JOIN latest_metrics m1 ON m1.target_type = 'mca' AND m1.associated_id = LOWER(law.ward_code)
+            LEFT JOIN challenger_data c ON c.target_role = 'mca'
+                AND c.associated_id = law.ward_code
+            WHERE law.ward_code IS NOT NULL
+              AND law.mca_name IS NOT NULL AND TRIM(law.mca_name) != ''
         ),
         ranked_profiles AS (
             SELECT 
-                'inc-' || county_code || '-' || LPAD(ROW_NUMBER() OVER (
-                    PARTITION BY county_code 
-                    ORDER BY role_rank ASC, numeric_sort_id ASC, name ASC
-                )::text, 3, '0') AS id,
-                '#' || county_code || '-' || LPAD(ROW_NUMBER() OVER (
-                    PARTITION BY county_code 
-                    ORDER BY role_rank ASC, numeric_sort_id ASC, name ASC
-                )::text, 3, '0') AS display_id,
+                CASE
+                    WHEN seat_layer = 'EXECUTIVE' AND target_role = 'president' THEN 'nat-pres-01'
+                    WHEN seat_layer = 'EXECUTIVE' AND target_role = 'deputy_president' THEN 'nat-dpres-01'
+                    WHEN target_role = 'governor' THEN 'INC-GOV-' || LPAD(assoc_id::text, 3, '0')
+                    WHEN target_role = 'senator' THEN 'INC-SEN-' || LPAD(assoc_id::text, 3, '0')
+                    WHEN target_role = 'women_rep' THEN 'INC-WR-' || LPAD(assoc_id::text, 3, '0')
+                    WHEN target_role = 'mp' THEN 'INC-MP-' || assoc_id::text
+                    WHEN target_role = 'mca' THEN 'INC-MCA-' || assoc_id::text
+                    ELSE 'inc-' || county_code || '-' || LPAD(ROW_NUMBER() OVER (PARTITION BY county_code
+                        ORDER BY role_rank ASC, numeric_sort_id ASC, name ASC
+                    )::text, 3, '0')
+                END AS id,
+                CASE
+                    WHEN target_role = 'mp' THEN 'INC-MP-' || assoc_id::text
+                    WHEN target_role = 'mca' THEN 'INC-MCA-' || assoc_id::text
+                    ELSE '#' || county_code || '-' || LPAD(ROW_NUMBER() OVER (
+                        PARTITION BY county_code
+                        ORDER BY role_rank ASC, numeric_sort_id ASC, name ASC
+                    )::text, 3, '0')
+                END AS display_id,
                 ROW_NUMBER() OVER (
                     PARTITION BY county_code 
                     ORDER BY role_rank ASC, numeric_sort_id ASC, name ASC
@@ -1595,6 +2271,29 @@ async def get_harmonized_profiles(
                 record['challengers'] = json.loads(record['challengers'])
             except Exception:
                 record['challengers'] = []
+        if not isinstance(record.get("challengers"), list):
+            record["challengers"] = []
+        for challenger in record["challengers"]:
+            pillars = challenger.get("manifesto_pillars")
+            if isinstance(pillars, dict):
+                summary = pillars.get("summary")
+                challenger["manifesto_pillars"] = (
+                    [str(summary)]
+                    if summary
+                    else [str(value) for value in pillars.values()]
+                )
+            elif isinstance(pillars, str):
+                try:
+                    decoded_pillars = json.loads(pillars)
+                except json.JSONDecodeError:
+                    decoded_pillars = [pillars]
+                challenger["manifesto_pillars"] = (
+                    [str(value) for value in decoded_pillars]
+                    if isinstance(decoded_pillars, list)
+                    else [str(decoded_pillars)]
+                )
+            elif not isinstance(pillars, list):
+                challenger["manifesto_pillars"] = []
         profiles.append(record)
         
     return profiles
@@ -1969,8 +2668,17 @@ async def register_alternative_challenger(
 )
 async def process_system_scores(conn: asyncpg.Connection = Depends(get_db_connection)):
     challengers = await conn.fetch("""
-        SELECT challenger_id, party_affiliation, background_dossier, manifesto_pillars, target_role, county_code, constituency_id, ward_id 
-        FROM alternative_challengers
+        SELECT ac.challenger_id, ac.party_affiliation, ac.background_dossier,
+               ac.manifesto_pillars, ac.target_role, ac.county_code,
+               ac.constituency_id, pc.constituency_code, ac.ward_id,
+               law.ward_code
+        FROM alternative_challengers ac
+        LEFT JOIN parliament_constituencies pc
+          ON ac.target_role = 'mp'
+         AND ac.constituency_id = pc.constituency_id
+        LEFT JOIN local_assembly_wards law
+          ON ac.target_role = 'mca'
+         AND ac.ward_id = law.ward_id
     """)
     
     processed_challengers_count = 0
@@ -2012,9 +2720,9 @@ async def process_system_scores(conn: asyncpg.Connection = Depends(get_db_connec
         if role in ["governor", "senator", "women_rep"]:
             assoc_id = str(c["county_code"])
         elif role == "mp":
-            assoc_id = str(c["constituency_id"])
+            assoc_id = str(c["constituency_code"]) if c["constituency_code"] else None
         elif role == "mca":
-            assoc_id = str(c["ward_id"])
+            assoc_id = str(c["ward_code"]) if c["ward_code"] else None
 
         if assoc_id:
             s_key = (role, assoc_id)
@@ -2024,8 +2732,12 @@ async def process_system_scores(conn: asyncpg.Connection = Depends(get_db_connec
     executives = await conn.fetch("SELECT office_id, role FROM national_executive WHERE status = 'Active' OR status IS NULL")
     
     counties = await conn.fetch("SELECT county_code FROM administrative_counties")
-    parliaments = await conn.fetch("SELECT constituency_id FROM parliament_constituencies")
-    wards = await conn.fetch("SELECT ward_id FROM local_assembly_wards")
+    parliaments = await conn.fetch(
+        "SELECT constituency_code FROM parliament_constituencies WHERE constituency_code IS NOT NULL"
+    )
+    wards = await conn.fetch(
+        "SELECT ward_code FROM local_assembly_wards WHERE ward_code IS NOT NULL"
+    )
     
     updated_incumbents_count = 0
     
@@ -2037,8 +2749,8 @@ async def process_system_scores(conn: asyncpg.Connection = Depends(get_db_connec
     incumbent_targets += [("governor", co["county_code"]) for co in counties] + \
                          [("senator", co["county_code"]) for co in counties] + \
                          [("women_rep", co["county_code"]) for co in counties] + \
-                         [("mp", str(p["constituency_id"])) for p in parliaments] + \
-                         [("mca", str(w["ward_id"])) for w in wards]
+                         [("mp", str(p["constituency_code"])) for p in parliaments] + \
+                         [("mca", str(w["ward_code"])) for w in wards]
 
     for t_type, a_id in incumbent_targets:
         pressure_factor = spatial_risk_pressure.get((t_type, a_id), 0.0)
@@ -2048,8 +2760,7 @@ async def process_system_scores(conn: asyncpg.Connection = Depends(get_db_connec
         base_perf = 58 + (seat_seed % 28)
         base_risk = 10 + (seat_seed % 16)
         
-        # Non-zero baseline hate speech floor guarantees reasonable starting value
-        base_hate = round(max(8.0, min(85.0, 8.0 + (seat_seed % 34) / 10.0 + (seat_seed % 28) + int(pressure_factor * 1.5))), 1)
+        base_hate = None
         
         computed_risk_radar = min(base_risk + int(pressure_factor * 1.6), 98)
         if pressure_factor > 0:
@@ -2069,7 +2780,7 @@ async def process_system_scores(conn: asyncpg.Connection = Depends(get_db_connec
                 performance_score = EXCLUDED.performance_score,
                 risk_radar_index = EXCLUDED.risk_radar_index,
                 hate_speech_score = COALESCE(
-                    incumbent_accountability_metrics.hate_speech_score,
+                    NULLIF(incumbent_accountability_metrics.hate_speech_score, 0),
                     EXCLUDED.hate_speech_score
                 ),
                 updated_at = CURRENT_TIMESTAMP;
@@ -2094,12 +2805,117 @@ async def evaluate_representative_mandate(
     representative_id: str,
     conn: asyncpg.Connection = Depends(get_db_connection)
 ):
-    metrics_row = await conn.fetchrow("""
-        SELECT target_type, associated_id, jaba_meter, performance_score, risk_radar_index 
-        FROM incumbent_accountability_metrics 
-        WHERE associated_id = $1 OR target_type || '-' || associated_id = $2
-        OR 'inc-' || target_type || '-' || associated_id = $2
-    """, representative_id, representative_id)
+    parsed_type, parsed_associated_id = parse_representative_id(representative_id)
+    geographic_types = {"governor", "senator", "women_rep", "mp", "mca"}
+
+    if parsed_type in geographic_types and parsed_associated_id:
+        canonical_associated_id = (
+            (
+                await resolve_mca_associated_id(
+                    conn, representative_id, parsed_associated_id
+                )
+                if parsed_type == "mca"
+                else (
+                    parsed_associated_id.zfill(3)
+                    if parsed_type in {"governor", "senator", "women_rep"}
+                    else parsed_associated_id
+                )
+            )
+        )
+        if not canonical_associated_id:
+            raise HTTPException(status_code=404, detail="MCA IEBC ward code not found.")
+        legacy_slug = {
+            "governor": "governor",
+            "senator": "senator",
+            "women_rep": "women_rep",
+            "mp": "mp",
+            "mca": "mca",
+        }[parsed_type]
+        id_variants = list({
+            representative_id.strip().lower(),
+            f"inc-{legacy_slug}-{parsed_associated_id}".lower(),
+            f"inc-{legacy_slug}-{canonical_associated_id}".lower(),
+        })
+        metrics_row = await conn.fetchrow("""
+            SELECT target_type, associated_id, jaba_meter, performance_score, risk_radar_index
+            FROM incumbent_accountability_metrics
+            WHERE LOWER(target_type) = $1
+              AND (
+                    LOWER(associated_id) = $2
+                    OR LOWER(associated_id) = ANY($3::text[])
+                    OR (
+                        $1 IN ('governor', 'senator', 'women_rep')
+                        AND associated_id ~ '^[0-9]+$'
+                        AND LPAD(associated_id, 3, '0') = $4
+                    )
+              )
+            ORDER BY
+                CASE
+                    WHEN LOWER(associated_id) = $2 THEN 0
+                    WHEN LOWER(associated_id) = ANY($3::text[]) THEN 1
+                    ELSE 2
+                END,
+                updated_at DESC NULLS LAST
+            LIMIT 1
+        """, parsed_type, canonical_associated_id, id_variants, canonical_associated_id)
+    elif parsed_type in {"president", "deputy_president"} and parsed_associated_id:
+        executive_id_variants = [
+            parsed_associated_id,
+            f"inc-{parsed_type}-{parsed_associated_id}",
+        ]
+        metrics_row = await conn.fetchrow(
+            """
+            SELECT target_type, associated_id, jaba_meter, performance_score, risk_radar_index
+            FROM incumbent_accountability_metrics
+            WHERE LOWER(target_type) = $1
+              AND LOWER(associated_id) = ANY($2::text[])
+            ORDER BY
+                CASE
+                    WHEN LOWER(associated_id) = $3 THEN 0
+                    ELSE 1
+                END,
+                updated_at DESC NULLS LAST
+            LIMIT 1
+            """,
+            parsed_type,
+            [value.lower() for value in executive_id_variants],
+            parsed_associated_id.lower(),
+        )
+    else:
+        metrics_row = await conn.fetchrow("""
+            SELECT target_type, associated_id, jaba_meter, performance_score, risk_radar_index
+            FROM incumbent_accountability_metrics
+            WHERE associated_id = $1 OR target_type || '-' || associated_id = $2
+            OR 'inc-' || target_type || '-' || associated_id = $2
+            OR (
+                $2 = 'nat-pres-01'
+                AND target_type = 'president'
+                AND associated_id IN (
+                    SELECT office_id FROM national_executive
+                    WHERE LOWER(role) LIKE '%president%'
+                      AND LOWER(role) NOT LIKE '%deputy%'
+                      AND (status = 'Active' OR status IS NULL)
+                    UNION
+                    SELECT 'inc-president-' || office_id FROM national_executive
+                    WHERE LOWER(role) LIKE '%president%'
+                      AND LOWER(role) NOT LIKE '%deputy%'
+                      AND (status = 'Active' OR status IS NULL)
+                )
+            )
+            OR (
+                $2 = 'nat-dpres-01'
+                AND target_type = 'deputy_president'
+                AND associated_id IN (
+                    SELECT office_id FROM national_executive
+                    WHERE LOWER(role) LIKE '%deputy%'
+                      AND (status = 'Active' OR status IS NULL)
+                    UNION
+                    SELECT 'inc-deputy_president-' || office_id FROM national_executive
+                    WHERE LOWER(role) LIKE '%deputy%'
+                      AND (status = 'Active' OR status IS NULL)
+                )
+            )
+        """, representative_id, representative_id)
 
     if not metrics_row:
         raise HTTPException(status_code=404, detail="Representative metrics not found.")
@@ -2261,6 +3077,30 @@ async def dispatch_via_router(
     user_content: str, 
     temperature: float = 0.2
 ) -> dict:
+    if groq_client is None:
+        raise RuntimeError("GROQ_API_KEY is required for AI analysis.")
+    response = await groq_client.chat.completions.create(
+        model=GROQ_MODEL,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content[:3000]},
+        ],
+        response_format={"type": "json_object"},
+        temperature=temperature,
+        max_tokens=800,
+    )
+    raw_text = response.choices[0].message.content
+    if not raw_text:
+        raise ValueError("Groq returned an empty analysis response.")
+    return json.loads(raw_text)
+
+
+async def _legacy_dispatch_via_openai(
+    ctx: QueryContext,
+    system_prompt: str,
+    user_content: str,
+    temperature: float = 0.2
+) -> dict:
     start_time = time.time()
     policy_eval_latency = time.time() - start_time
 
@@ -2329,6 +3169,37 @@ async def submit_leader_intel(
     if severity_normalized not in ["LOW", "MEDIUM", "HIGH", "CRITICAL"]:
         raise HTTPException(status_code=400, detail="Invalid severity operational tier specified.")
 
+    associated_id = payload.associated_id.strip()
+    if target_normalized == "mp":
+        parsed_type, parsed_id = parse_representative_id(associated_id)
+        if parsed_type == "mp" and parsed_id:
+            constituency_code = await conn.fetchval(
+                """
+                SELECT constituency_code
+                FROM parliament_constituencies
+                WHERE constituency_code = $1
+                """,
+                parsed_id,
+            )
+            if not constituency_code:
+                raise HTTPException(status_code=404, detail="MP constituency code not found.")
+            associated_id = constituency_code
+        else:
+            constituency_code = await conn.fetchval(
+                """
+                SELECT constituency_code
+                FROM parliament_constituencies
+                WHERE constituency_id::text = $1
+                   OR constituency_code = $1
+                ORDER BY CASE WHEN constituency_id::text = $1 THEN 0 ELSE 1 END
+                LIMIT 1
+                """,
+                associated_id,
+            )
+            if not constituency_code:
+                raise HTTPException(status_code=404, detail="MP constituency code not found.")
+            associated_id = constituency_code
+
     try:
         insert_query = """
             INSERT INTO journalist_intel_reports (
@@ -2341,7 +3212,7 @@ async def submit_leader_intel(
             insert_query,
             payload.reporter_badge_hash.strip(),
             target_normalized,
-            payload.associated_id.strip(),
+            associated_id,
             payload.intel_summary.strip(),
             json.dumps(payload.evidence_links),
             severity_normalized
@@ -2352,7 +3223,7 @@ async def submit_leader_intel(
                 UPDATE incumbent_accountability_metrics 
                 SET risk_radar_index = LEAST(risk_radar_index + 12, 99)
                 WHERE target_type = $1 AND associated_id = $2
-            """, target_normalized, payload.associated_id.strip())
+            """, target_normalized, associated_id)
 
         return IntelSubmissionResponse(
             status="SUCCESS",
@@ -2478,7 +3349,16 @@ async def get_representative_ai_monitor(
     base_union_query = """
         SELECT * FROM (
             SELECT 
-                ne.office_id AS id, ne.office_id AS challenger_id,
+                CASE
+                    WHEN LOWER(ne.role) LIKE '%deputy%' THEN 'nat-dpres-01'
+                    WHEN LOWER(ne.role) LIKE '%president%' THEN 'nat-pres-01'
+                    ELSE ne.office_id
+                END AS id,
+                CASE
+                    WHEN LOWER(ne.role) LIKE '%deputy%' THEN 'nat-dpres-01'
+                    WHEN LOWER(ne.role) LIKE '%president%' THEN 'nat-pres-01'
+                    ELSE ne.office_id
+                END AS challenger_id,
                 ne.leader_name AS full_name, UPPER(ne.role) AS target_role,
                 COALESCE(ne.party, 'Independent') AS party_affiliation, 'INCUMBENT' AS type,
                 COALESCE(ne.country, 'Kenya') AS target_location_name,
@@ -2526,22 +3406,26 @@ async def get_representative_ai_monitor(
             UNION ALL
             
             SELECT 
-                pc.constituency_id::text AS id, pc.constituency_id::text AS challenger_id,
+                'INC-MP-' || pc.constituency_code AS id,
+                'INC-MP-' || pc.constituency_code AS challenger_id,
                 pc.mp_name AS full_name, 'MP' AS target_role, 
                 COALESCE(pc.mp_party, 'Independent') AS party_affiliation, 'INCUMBENT' AS type,
                 pc.constituency_name AS target_location_name, 6 AS role_rank
             FROM parliament_constituencies pc
-            WHERE pc.mp_name IS NOT NULL AND TRIM(pc.mp_name) != ''
+            WHERE pc.constituency_code IS NOT NULL
+              AND pc.mp_name IS NOT NULL AND TRIM(pc.mp_name) != ''
             
             UNION ALL
             
             SELECT 
-                law.ward_id::text AS id, law.ward_id::text AS challenger_id,
+                'INC-MCA-' || law.ward_code AS id,
+                'INC-MCA-' || law.ward_code AS challenger_id,
                 law.mca_name AS full_name, 'MCA' AS target_role, 
                 COALESCE(law.mca_party, 'Independent') AS party_affiliation, 'INCUMBENT' AS type,
                 law.ward_name AS target_location_name, 7 AS role_rank
             FROM local_assembly_wards law
-            WHERE law.mca_name IS NOT NULL AND TRIM(law.mca_name) != ''
+            WHERE law.ward_code IS NOT NULL
+              AND law.mca_name IS NOT NULL AND TRIM(law.mca_name) != ''
 
             UNION ALL
             
