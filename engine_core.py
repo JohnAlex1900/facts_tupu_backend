@@ -408,7 +408,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://facts-tupu.vercel.app", "https://www.factstupu.com", "http://localhost:3000"],
+    allow_origins=["https://facts-tupu.vercel.app", "https://www.factstupu.co.ke", "https://www.factstupu.com", "http://localhost:3000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
